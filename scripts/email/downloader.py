@@ -42,8 +42,8 @@ GMAIL_IMAP_CONNECTION_LIMIT = 15
 RESERVED_IMAP_CONNECTIONS = 2
 MAIN_IMAP_CONNECTIONS = 1
 MAX_DOWNLOAD_WORKERS = max(1, GMAIL_IMAP_CONNECTION_LIMIT - RESERVED_IMAP_CONNECTIONS - MAIN_IMAP_CONNECTIONS)
-STATUS_REFRESH_SECONDS = 0.2
-STATUS_ANIMATION_SECONDS = 0.35
+STATUS_REFRESH_SECONDS = 0.08
+STATUS_ANIMATION_SECONDS = 0.25
 RAW_FILE_RE = re.compile(r"__(?P<gmail_msg_id>\d+)\.eml$")
 RETRYABLE_GMAIL_ERROR_PATTERNS = (
     "too many simultaneous",
@@ -67,6 +67,7 @@ RETRYABLE_NETWORK_ERROR_PATTERNS = (
     "imap abort:",
     "socket error:",
     "networkvalidationerror:",
+    "downloaded size mismatch",
 )
 
 
@@ -149,6 +150,7 @@ class PendingDownload:
     mailbox_name: str
     previous_entry: dict[str, Any] | None
     restoring: bool
+    repairing_corrupt: bool = False
 
 
 @dataclass(frozen=True)
@@ -803,14 +805,6 @@ def fetch_raw_message(connection: imaplib.IMAP4_SSL, uid: bytes) -> bytes:
     raise RuntimeError(f"Gmail returned no raw email body for UID {uid.decode('ascii', 'replace')}")
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def filename_for_message(metadata: MessageMetadata) -> str:
     date_part = metadata.internal_date.date().isoformat()
     return f"{date_part}__{metadata.gmail_msg_id}.eml"
@@ -853,6 +847,19 @@ def message_file_exists(email_root: Path, entry: dict[str, Any]) -> Path | None:
     return None
 
 
+def message_file_needs_repair(path: Path, metadata: MessageMetadata) -> bool:
+    try:
+        byte_size = path.stat().st_size
+    except FileNotFoundError:
+        return True
+
+    if byte_size <= 0:
+        return True
+    if metadata.rfc822_size is not None and byte_size != metadata.rfc822_size:
+        return True
+    return False
+
+
 def merge_label(entry: dict[str, Any], label: str) -> bool:
     labels = entry.setdefault("labels", [])
     if not isinstance(labels, list):
@@ -872,6 +879,7 @@ def index_entry_for_file(
     mailbox_name: str,
     *,
     downloaded_at: str | None,
+    sha256: str | None = None,
 ) -> dict[str, Any]:
     relative_path = path.relative_to(email_root).as_posix()
     stat = path.stat()
@@ -883,10 +891,11 @@ def index_entry_for_file(
         "internal_date": metadata.internal_date.isoformat(),
         "labels": [mailbox_name],
         "byte_size": stat.st_size,
-        "sha256": sha256_file(path),
         "last_seen_at": iso_now(),
     }
 
+    if sha256 is not None:
+        entry["sha256"] = sha256
     if metadata.rfc822_size is not None:
         entry["gmail_rfc822_size"] = metadata.rfc822_size
     if downloaded_at is not None:
@@ -1351,6 +1360,16 @@ def download_pending_with_retries(
 
             raw_message = fetch_raw_message(connection, pending.uid)
             byte_size, digest = write_raw_message(pending.final_path, raw_message)
+            if pending.metadata.rfc822_size is not None and byte_size != pending.metadata.rfc822_size:
+                try:
+                    pending.final_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    "downloaded size mismatch for UID "
+                    f"{pending.uid.decode('ascii', 'replace')}: got {byte_size} bytes, "
+                    f"expected {pending.metadata.rfc822_size}"
+                )
             return (
                 connection,
                 DownloadOutcome(
@@ -1620,7 +1639,7 @@ def total_progress_message(stats: dict[str, int], started_at: float, activity: s
     elapsed = elapsed_since(started_at)
     eta = estimate_remaining(done, total, elapsed)
     byte_rate = int(stats["downloaded_bytes"] / elapsed)
-    downloaded = stats["downloaded"] + stats["restored_missing"]
+    downloaded = stats["downloaded"] + stats["restored_missing"] + stats["repaired_corrupt"]
     current = activity or "checking for missing emails..."
 
     return "\n".join(
@@ -1628,7 +1647,7 @@ def total_progress_message(stats: dict[str, int], started_at: float, activity: s
             "Gmail Downloader",
             f"{progress_bar(done, total)} {progress_percent(done, total).strip()}  "
             f"{format_int(done)} / {format_int(total)} emails archived",
-            f"Downloaded {format_int(downloaded)} new emails, {format_bytes(stats['downloaded_bytes'])}",
+            f"Downloaded {format_int(downloaded)} emails, {format_bytes(stats['downloaded_bytes'])}",
             f"Speed {format_bytes(byte_rate)}/s    Elapsed {format_duration(elapsed)}    "
             f"Left about {format_duration(eta)}",
             f"Current: {current}",
@@ -1659,7 +1678,7 @@ def print_summary_section(title: str, rows: list[tuple[str, str]]) -> None:
 
 
 def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_seconds: float) -> None:
-    raw_downloaded = summary["downloaded"] + summary["restored_missing"]
+    raw_downloaded = summary["downloaded"] + summary["restored_missing"] + summary["repaired_corrupt"]
     byte_rate = int(summary["downloaded_bytes"] / max(elapsed_seconds, 0.001))
     status = "success" if summary["errors"] == 0 else "completed with errors"
 
@@ -1673,6 +1692,7 @@ def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_secon
             ("account messages", format_int(summary["account_message_total"])),
             ("downloaded", format_int(summary["downloaded"])),
             ("restored missing", format_int(summary["restored_missing"])),
+            ("repaired corrupt", format_int(summary["repaired_corrupt"])),
             ("indexed existing", format_int(summary["indexed_existing"])),
             ("skipped", format_int(summary["skipped"])),
             ("total indexed", format_int(summary["total_messages_indexed"])),
@@ -1693,6 +1713,7 @@ def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_secon
         "Reliability",
         [
             ("errors", format_int(summary["errors"])),
+            ("corrupt files found", format_int(summary["corrupt_found"])),
             ("download retries", format_int(summary["download_retries"])),
             ("worker reconnects", format_int(summary["worker_reconnects"])),
         ]
@@ -1860,6 +1881,21 @@ def sync_mailbox(
             if isinstance(entry, dict):
                 existing_path = message_file_exists(email_root, entry)
                 if existing_path is not None:
+                    if message_file_needs_repair(existing_path, metadata):
+                        stats["corrupt_found"] += 1
+                        pending_downloads.append(
+                            PendingDownload(
+                                uid=uid,
+                                metadata=metadata,
+                                final_path=existing_path,
+                                mailbox_name=mailbox.display_name,
+                                previous_entry=entry,
+                                restoring=True,
+                                repairing_corrupt=True,
+                            )
+                        )
+                        continue
+
                     if state_store.mark_seen(metadata.gmail_msg_id, mailbox.display_name):
                         stats["labels_merged"] += 1
                     dirty_count += 1
@@ -1868,12 +1904,28 @@ def sync_mailbox(
 
                 existing_by_id = find_existing_message_file(existing_files, metadata.gmail_msg_id)
                 if existing_by_id is not None:
+                    if message_file_needs_repair(existing_by_id, metadata):
+                        stats["corrupt_found"] += 1
+                        pending_downloads.append(
+                            PendingDownload(
+                                uid=uid,
+                                metadata=metadata,
+                                final_path=existing_by_id,
+                                mailbox_name=mailbox.display_name,
+                                previous_entry=entry,
+                                restoring=True,
+                                repairing_corrupt=True,
+                            )
+                        )
+                        continue
+
                     replacement = index_entry_for_file(
                         metadata,
                         existing_by_id,
                         email_root,
                         mailbox.display_name,
                         downloaded_at=entry.get("downloaded_at"),
+                        sha256=entry.get("sha256") if isinstance(entry.get("sha256"), str) else None,
                     )
                     restore_existing_labels(replacement, entry)
                     state_store.upsert_message(replacement)
@@ -1898,6 +1950,21 @@ def sync_mailbox(
             else:
                 existing_by_id = find_existing_message_file(existing_files, metadata.gmail_msg_id)
                 if existing_by_id is not None:
+                    if message_file_needs_repair(existing_by_id, metadata):
+                        stats["corrupt_found"] += 1
+                        pending_downloads.append(
+                            PendingDownload(
+                                uid=uid,
+                                metadata=metadata,
+                                final_path=existing_by_id,
+                                mailbox_name=mailbox.display_name,
+                                previous_entry=None,
+                                restoring=False,
+                                repairing_corrupt=True,
+                            )
+                        )
+                        continue
+
                     entry = index_entry_for_file(
                         metadata,
                         existing_by_id,
@@ -1917,6 +1984,21 @@ def sync_mailbox(
             final_path = raw_dir / filename
 
             if final_path.exists():
+                if message_file_needs_repair(final_path, metadata):
+                    stats["corrupt_found"] += 1
+                    pending_downloads.append(
+                        PendingDownload(
+                            uid=uid,
+                            metadata=metadata,
+                            final_path=final_path,
+                            mailbox_name=mailbox.display_name,
+                            previous_entry=None,
+                            restoring=False,
+                            repairing_corrupt=True,
+                        )
+                    )
+                    continue
+
                 entry = index_entry_for_file(
                     metadata,
                     final_path,
@@ -1987,7 +2069,11 @@ def sync_mailbox(
             messages_by_id[pending.metadata.gmail_msg_id] = entry
             existing_files[pending.metadata.gmail_msg_id] = pending.final_path
             stats["downloaded_bytes"] += outcome.byte_size
-            if pending.restoring:
+            if pending.repairing_corrupt:
+                stats["repaired_corrupt"] += 1
+                if not pending.restoring:
+                    mark_work_done(stats)
+            elif pending.restoring:
                 stats["restored_missing"] += 1
             else:
                 stats["downloaded"] += 1
@@ -2081,6 +2167,8 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             "downloaded_bytes": 0,
             "skipped": 0,
             "restored_missing": 0,
+            "repaired_corrupt": 0,
+            "corrupt_found": 0,
             "indexed_existing": 0,
             "labels_merged": 0,
             "errors": 0,

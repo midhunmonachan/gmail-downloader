@@ -20,9 +20,11 @@ The script also:
 
 - Fetches message metadata in adaptive batches up to 1000 UIDs, backing down when Gmail rejects a large batch and growing again after stable batches.
 - Pre-indexes existing `.eml` filenames once at startup instead of scanning the filesystem per message.
+- Avoids rehashing existing `.eml` files during normal scans; SHA-256 is still computed for newly downloaded messages while writing.
 - Stores message and mailbox state in SQLite for faster lookups as the archive grows.
 - Queues larger raw emails first inside each batch so parallel workers spend less time waiting on one large message at the end.
 - Downloads missing raw emails in parallel.
+- Redownloads existing `.eml` files when their local byte size does not match Gmail's `RFC822.SIZE`.
 - Retries transient raw-email fetch failures inside each worker by reconnecting and reselecting the mailbox before retrying the same UID.
 - Automatically backs down worker count when Gmail reports known retryable connection/rate-limit errors.
 - Processes Gmail UIDs from highest to lowest so newer messages are queued first.
@@ -91,8 +93,11 @@ On rerun:
 
 - Existing indexed `.eml` files are skipped.
 - Missing `.eml` files are downloaded again.
+- Existing `.eml` files with a local byte size that differs from Gmail's `RFC822.SIZE` are downloaded again.
 - Messages that appear in multiple Gmail labels are stored once.
 - Label/mailbox sightings are merged into `emails/_state/message_index.sqlite3`.
+
+This detects common corruption such as truncated, empty, or wrong-size `.eml` files without re-downloading every message. It does not prove that a same-size local file has identical bytes unless that message is downloaded again.
 
 ## Standalone Script Use
 
