@@ -45,6 +45,9 @@ MAIN_IMAP_CONNECTIONS = 1
 MAX_DOWNLOAD_WORKERS = max(1, GMAIL_IMAP_CONNECTION_LIMIT - RESERVED_IMAP_CONNECTIONS - MAIN_IMAP_CONNECTIONS)
 STATUS_REFRESH_SECONDS = 0.08
 STATUS_ANIMATION_SECONDS = 0.25
+ETA_MIN_SAMPLE_SECONDS = 5.0
+ETA_MIN_SAMPLE_MESSAGES = 20
+ETA_SMOOTHING_ALPHA = 0.35
 RAW_FILE_RE = re.compile(r"__(?P<gmail_msg_id>\d+)\.eml$")
 RETRYABLE_GMAIL_ERROR_PATTERNS = (
     "too many simultaneous",
@@ -416,6 +419,12 @@ def format_duration(seconds: float | None) -> str:
     return f"{seconds}s"
 
 
+def format_remaining(seconds: float | None) -> str:
+    if seconds is None:
+        return "estimating"
+    return f"about {format_duration(seconds)}"
+
+
 def progress_bar(done: int, total: int, *, width: int = 18) -> str:
     if total <= 0:
         return "[" + "-" * width + "]"
@@ -436,10 +445,17 @@ def elapsed_since(started_at: float) -> float:
     return max(0.001, datetime.now().timestamp() - started_at)
 
 
-def estimate_remaining(done: int, total: int, elapsed: float) -> float | None:
-    if done <= 0 or total <= done:
-        return 0.0 if total <= done else None
-    rate = done / elapsed
+def estimate_remaining(done: int, total: int, sample_done: int, sample_elapsed: float) -> float | None:
+    if total > 0 and total <= done:
+        return 0.0
+    if total <= 0:
+        return None
+    if done <= 0:
+        return None
+    if sample_done < ETA_MIN_SAMPLE_MESSAGES or sample_elapsed < ETA_MIN_SAMPLE_SECONDS:
+        return None
+
+    rate = sample_done / sample_elapsed
     if rate <= 0:
         return None
     return (total - done) / rate
@@ -1847,14 +1863,36 @@ def mark_work_done(stats: dict[str, int], count: int = 1) -> None:
     stats["work_done"] = min(next_value, total) if total > 0 else next_value
 
 
-def total_progress_message(stats: dict[str, int], started_at: float, activity: str = "") -> str:
+def reset_eta_sample(stats: dict[str, Any]) -> None:
+    stats["eta_started_at"] = datetime.now().timestamp()
+    stats["eta_baseline_done"] = stats.get("work_done", 0) + stats.get("active_archived", 0)
+    stats["eta_smoothed_remaining"] = None
+
+
+def smoothed_eta(stats: dict[str, Any], raw_eta: float | None) -> float | None:
+    if raw_eta is None:
+        return None
+
+    previous = stats.get("eta_smoothed_remaining")
+    if isinstance(previous, (int, float)) and previous > 0 and raw_eta > 0:
+        raw_eta = (ETA_SMOOTHING_ALPHA * raw_eta) + ((1 - ETA_SMOOTHING_ALPHA) * float(previous))
+
+    stats["eta_smoothed_remaining"] = raw_eta
+    return raw_eta
+
+
+def total_progress_message(stats: dict[str, Any], started_at: float, activity: str = "") -> str:
     active_archived = stats.get("active_archived", 0)
     done = stats.get("work_done", 0) + active_archived
     total = stats.get("work_total", 0)
     if total > 0:
         done = min(done, total)
     elapsed = elapsed_since(started_at)
-    eta = estimate_remaining(done, total, elapsed)
+    eta_started_at = stats.get("eta_started_at", 0)
+    eta_baseline_done = stats.get("eta_baseline_done", done)
+    sample_elapsed = elapsed_since(eta_started_at) if isinstance(eta_started_at, (int, float)) and eta_started_at > 0 else 0
+    sample_done = max(0, done - eta_baseline_done) if isinstance(eta_baseline_done, int) else 0
+    eta = smoothed_eta(stats, estimate_remaining(done, total, sample_done, sample_elapsed))
     downloaded_bytes = stats["downloaded_bytes"] + stats.get("active_downloaded_bytes", 0)
     byte_rate = int(downloaded_bytes / elapsed)
     downloaded = (
@@ -1872,7 +1910,7 @@ def total_progress_message(stats: dict[str, int], started_at: float, activity: s
             f"{format_int(done)} / {format_int(total)} emails archived",
             f"Downloaded {format_int(downloaded)} emails, {format_bytes(downloaded_bytes)}",
             f"Speed {format_bytes(byte_rate)}/s    Elapsed {format_duration(elapsed)}    "
-            f"Left about {format_duration(eta)}",
+            f"Left {format_remaining(eta)}",
             f"Current: {current}",
         ]
     )
@@ -2527,6 +2565,9 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             "active_downloaded": 0,
             "active_downloaded_bytes": 0,
             "active_archived": 0,
+            "eta_started_at": 0.0,
+            "eta_baseline_done": 0,
+            "eta_smoothed_remaining": None,
         }
 
         mailboxes = list_selectable_mailboxes(connection)
@@ -2545,6 +2586,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             status,
             operation_started_at,
         )
+        reset_eta_sample(stats)
 
         status.update(total_progress_message(stats, operation_started_at), force=True)
 
@@ -2581,6 +2623,9 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         summary.pop("active_downloaded", None)
         summary.pop("active_downloaded_bytes", None)
         summary.pop("active_archived", None)
+        summary.pop("eta_started_at", None)
+        summary.pop("eta_baseline_done", None)
+        summary.pop("eta_smoothed_remaining", None)
         return summary
     finally:
         status.done()
