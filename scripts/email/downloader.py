@@ -132,34 +132,37 @@ class NetworkValidationError(RuntimeError):
 
 class LiveStatus:
     def __init__(self) -> None:
-        self.enabled = sys.stdout.isatty()
+        plain_status = os.environ.get("GMAIL_DOWNLOADER_PLAIN_STATUS", "").lower()
+        self.dynamic = plain_status not in {"1", "true", "yes", "on"}
         self.last_message = ""
+        self.last_width = 0
         self.last_update = 0.0
 
     def update(self, message: str, *, force: bool = False) -> None:
         now = datetime.now().timestamp()
         if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
             return
-        previous = self.last_message
         self.last_message = message
+        self.last_width = max(len(message), self.last_width)
         self.last_update = now
-        if self.enabled:
-            width = max(len(message), len(previous))
-            print("\r" + message.ljust(width), end="", flush=True)
-        else:
+        if self.dynamic:
+            print("\r" + message.ljust(self.last_width), end="", flush=True)
+        elif force:
             print(message, flush=True)
 
     def line(self, message: str = "") -> None:
-        if self.enabled and self.last_message:
-            print("\r" + " " * len(self.last_message) + "\r", end="", flush=True)
+        if self.dynamic and self.last_message:
+            print("\r" + " " * self.last_width + "\r", end="", flush=True)
             self.last_message = ""
+            self.last_width = 0
         if message:
             print(message, flush=True)
 
     def done(self) -> None:
-        if self.enabled and self.last_message:
+        if self.dynamic and self.last_message:
             print()
             self.last_message = ""
+            self.last_width = 0
 
 
 class CompactHelpParser(argparse.ArgumentParser):
@@ -181,6 +184,7 @@ class CompactHelpParser(argparse.ArgumentParser):
                 "  GMAIL_DOWNLOADER_CONFIG",
                 "  GMAIL_DOWNLOADER_EMAILS_DIR",
                 "  GMAIL_DOWNLOADER_WORKERS",
+                "  GMAIL_DOWNLOADER_PLAIN_STATUS",
             ]
         ) + "\n"
 
