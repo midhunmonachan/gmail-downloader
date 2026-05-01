@@ -23,6 +23,7 @@ The script also:
 - Stores message and mailbox state in SQLite for faster lookups as the archive grows.
 - Queues larger raw emails first inside each batch so parallel workers spend less time waiting on one large message at the end.
 - Downloads missing raw emails in parallel.
+- Retries transient raw-email fetch failures inside each worker by reconnecting and reselecting the mailbox before retrying the same UID.
 - Automatically backs down worker count when Gmail reports known retryable connection/rate-limit errors.
 - Processes Gmail UIDs from highest to lowest so newer messages are queued first.
 - Computes SHA-256 while writing each `.eml` file.

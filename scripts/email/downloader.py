@@ -14,6 +14,7 @@ import shutil
 import socket
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,9 @@ MIN_METADATA_BATCH_SIZE = 100
 METADATA_BATCH_GROW_AFTER = 8
 DB_COMMIT_EVERY = 1000
 SQLITE_QUERY_CHUNK_SIZE = 900
+WORKER_MESSAGE_ATTEMPTS = 4
+WORKER_RETRY_BASE_DELAY_SECONDS = 0.4
+WORKER_RETRY_MAX_DELAY_SECONDS = 3.0
 GMAIL_IMAP_CONNECTION_LIMIT = 15
 RESERVED_IMAP_CONNECTIONS = 2
 MAIN_IMAP_CONNECTIONS = 1
@@ -56,6 +60,8 @@ RETRYABLE_NETWORK_ERROR_PATTERNS = (
     "connectionreseterror:",
     "connectionabortederror:",
     "brokenpipeerror:",
+    "sslerror:",
+    "ssleoferror:",
     "imap abort:",
     "socket error:",
     "networkvalidationerror:",
@@ -150,6 +156,8 @@ class DownloadOutcome:
     sha256: str | None
     downloaded_at: str | None
     error: str | None
+    retries: int = 0
+    reconnects: int = 0
 
 
 class CredentialError(RuntimeError):
@@ -1169,6 +1177,10 @@ def is_retryable_download_error(error: str | None) -> bool:
     )
 
 
+def worker_retry_delay(attempt_index: int) -> float:
+    return min(WORKER_RETRY_MAX_DELAY_SECONDS, WORKER_RETRY_BASE_DELAY_SECONDS * (2 ** attempt_index))
+
+
 def reduced_worker_count(current_count: int) -> int:
     if current_count > 8:
         return 8
@@ -1213,6 +1225,94 @@ def sorted_pending_downloads(pending_items: list[PendingDownload]) -> list[Pendi
     )
 
 
+def open_worker_connection(credentials: Credentials, mailbox: Mailbox) -> imaplib.IMAP4_SSL:
+    connection = connect_and_login(credentials)
+    try:
+        select_mailbox(connection, mailbox)
+    except Exception:
+        close_connection(connection)
+        raise
+    return connection
+
+
+def download_pending_with_retries(
+    credentials: Credentials,
+    mailbox: Mailbox,
+    pending: PendingDownload,
+    connection: imaplib.IMAP4_SSL | None,
+) -> tuple[imaplib.IMAP4_SSL | None, DownloadOutcome]:
+    retries = 0
+    reconnects = 0
+
+    for attempt_index in range(WORKER_MESSAGE_ATTEMPTS):
+        try:
+            if connection is None:
+                connection = open_worker_connection(credentials, mailbox)
+
+            raw_message = fetch_raw_message(connection, pending.uid)
+            byte_size, digest = write_raw_message(pending.final_path, raw_message)
+            return (
+                connection,
+                DownloadOutcome(
+                    pending=pending,
+                    byte_size=byte_size,
+                    sha256=digest,
+                    downloaded_at=iso_now(),
+                    error=None,
+                    retries=retries,
+                    reconnects=reconnects,
+                ),
+            )
+        except Exception as exc:
+            error = format_exception(exc)
+            if not is_retryable_download_error(error):
+                return (
+                    connection,
+                    DownloadOutcome(
+                        pending=pending,
+                        byte_size=None,
+                        sha256=None,
+                        downloaded_at=None,
+                        error=error,
+                        retries=retries,
+                        reconnects=reconnects,
+                    ),
+                )
+
+            close_connection(connection)
+            connection = None
+            if attempt_index >= WORKER_MESSAGE_ATTEMPTS - 1:
+                return (
+                    connection,
+                    DownloadOutcome(
+                        pending=pending,
+                        byte_size=None,
+                        sha256=None,
+                        downloaded_at=None,
+                        error=f"{error} (after {WORKER_MESSAGE_ATTEMPTS} attempts)",
+                        retries=retries,
+                        reconnects=reconnects,
+                    ),
+                )
+
+            retries += 1
+            reconnects += 1
+            time.sleep(worker_retry_delay(attempt_index))
+
+    return (
+        connection,
+        DownloadOutcome(
+            pending=pending,
+            byte_size=None,
+            sha256=None,
+            downloaded_at=None,
+            error="download worker exhausted retry attempts",
+            retries=retries,
+            reconnects=reconnects,
+        ),
+    )
+
+
 def download_worker(
     credentials: Credentials,
     mailbox: Mailbox,
@@ -1223,10 +1323,11 @@ def download_worker(
     connection_error: str | None = None
 
     try:
-        connection = connect_and_login(credentials)
-        select_mailbox(connection, mailbox)
+        connection = open_worker_connection(credentials, mailbox)
     except Exception as exc:
         connection_error = format_exception(exc)
+        if is_retryable_download_error(connection_error):
+            connection_error = None
 
     try:
         while True:
@@ -1247,29 +1348,8 @@ def download_worker(
                     )
                     continue
 
-                if connection is None:
-                    result_queue.put(
-                        DownloadOutcome(
-                            pending=pending,
-                            byte_size=None,
-                            sha256=None,
-                            downloaded_at=None,
-                            error="download worker did not open an IMAP connection",
-                        )
-                    )
-                    continue
-
-                raw_message = fetch_raw_message(connection, pending.uid)
-                byte_size, digest = write_raw_message(pending.final_path, raw_message)
-                result_queue.put(
-                    DownloadOutcome(
-                        pending=pending,
-                        byte_size=byte_size,
-                        sha256=digest,
-                        downloaded_at=iso_now(),
-                        error=None,
-                    )
-                )
+                connection, outcome = download_pending_with_retries(credentials, mailbox, pending, connection)
+                result_queue.put(outcome)
             except Exception as exc:
                 if pending is not None:
                     result_queue.put(
@@ -1304,6 +1384,8 @@ def download_pending_messages(
     result_queue: Queue[DownloadOutcome] = Queue()
     outcomes: list[DownloadOutcome] = []
     downloaded_bytes = 0
+    download_retries = 0
+    worker_reconnects = 0
     started_at = datetime.now().timestamp()
 
     threads = [
@@ -1329,6 +1411,8 @@ def download_pending_messages(
             len(pending_items),
             0,
             expected_bytes,
+            download_retries,
+            worker_reconnects,
             started_at,
             worker_count,
         ),
@@ -1340,6 +1424,8 @@ def download_pending_messages(
         outcomes.append(outcome)
         if outcome.byte_size is not None:
             downloaded_bytes += outcome.byte_size
+        download_retries += outcome.retries
+        worker_reconnects += outcome.reconnects
         completed = len(outcomes)
         status.update(
             download_progress_message(
@@ -1348,6 +1434,8 @@ def download_pending_messages(
                 len(pending_items),
                 downloaded_bytes,
                 expected_bytes,
+                download_retries,
+                worker_reconnects,
                 started_at,
                 worker_count,
             ),
@@ -1367,6 +1455,8 @@ def download_progress_message(
     total: int,
     downloaded_bytes: int,
     expected_bytes: int,
+    download_retries: int,
+    worker_reconnects: int,
     started_at: float,
     worker_count: int,
 ) -> str:
@@ -1377,10 +1467,15 @@ def download_progress_message(
     byte_progress = format_bytes(downloaded_bytes)
     if expected_bytes > 0:
         byte_progress += f"/{format_bytes(expected_bytes)}"
+    retry_detail = ""
+    if download_retries or worker_reconnects:
+        retry_detail = f" | retry {download_retries} | reconnect {worker_reconnects}"
+
     return (
         f"{mailbox_name} {progress_bar(completed, total)} downloads {completed}/{total} "
         f"| {byte_progress} | {message_rate:.1f}/s | {format_bytes(byte_rate)}/s "
         f"| elapsed {format_duration(elapsed)} | ETA {format_duration(eta)} | {worker_count} workers"
+        f"{retry_detail}"
     )
 
 
@@ -1397,6 +1492,8 @@ def download_with_adaptive_workers(
     while remaining:
         worker_count = int_from_stats(stats, "download_workers", DEFAULT_DOWNLOAD_WORKERS)
         outcomes = download_pending_messages(credentials, mailbox, remaining, status, worker_count)
+        stats["download_retries"] += sum(outcome.retries for outcome in outcomes)
+        stats["worker_reconnects"] += sum(outcome.reconnects for outcome in outcomes)
         retryable = [
             outcome
             for outcome in outcomes
@@ -1817,6 +1914,8 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             "errors": 0,
             "download_workers": DEFAULT_DOWNLOAD_WORKERS,
             "worker_backoffs": 0,
+            "download_retries": 0,
+            "worker_reconnects": 0,
             "metadata_batch_size": DEFAULT_METADATA_BATCH_SIZE,
             "metadata_batch_backoffs": 0,
             "metadata_batch_growths": 0,
@@ -1907,6 +2006,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Errors: {summary['errors']}")
         print(f"  Final workers: {summary['download_workers']}")
         print(f"  Worker backoffs: {summary['worker_backoffs']}")
+        print(f"  Download retries: {summary['download_retries']}")
+        print(f"  Worker reconnects: {summary['worker_reconnects']}")
         print(f"  Final metadata batch size: {summary['metadata_batch_size']}")
         print(f"  Metadata batch backoffs: {summary['metadata_batch_backoffs']}")
         print(f"  Metadata batch growths: {summary['metadata_batch_growths']}")
