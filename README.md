@@ -23,7 +23,7 @@ The script also:
 - Processes Gmail UIDs from highest to lowest so newer messages are queued first.
 - Computes SHA-256 while writing each `.eml` file.
 - Stores per-mailbox resume markers so later runs skip already-scanned UID ranges.
-- Shows live progress on one dynamic status line in interactive terminals and plain progress lines when output is redirected.
+- Shows a compact progress bar with elapsed time, ETA, UID rate, byte rate, download count, and errors.
 - Removes stale `.part` files at startup and on exit.
 
 Google documents a Gmail IMAP download bandwidth limit of 2500 MB per day for Workspace accounts: <https://support.google.com/a/answer/1071518>.

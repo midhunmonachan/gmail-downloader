@@ -10,6 +10,7 @@ import imaplib
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 from dataclasses import dataclass
@@ -141,6 +142,7 @@ class LiveStatus:
         now = datetime.now().timestamp()
         if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
             return
+        message = self.fit_message(message)
         self.last_message = message
         self.last_width = max(len(message), self.last_width)
         self.last_update = now
@@ -162,6 +164,16 @@ class LiveStatus:
             print()
             self.last_message = ""
             self.last_width = 0
+
+    def fit_message(self, message: str) -> str:
+        if not self.dynamic:
+            return message
+
+        columns = shutil.get_terminal_size((120, 20)).columns
+        limit = max(40, columns - 1)
+        if len(message) <= limit:
+            return message
+        return message[: limit - 4].rstrip() + " ..."
 
 
 class CompactHelpParser(argparse.ArgumentParser):
@@ -202,6 +214,42 @@ def format_bytes(byte_count: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{byte_count} B"
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "--"
+
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def progress_bar(done: int, total: int, *, width: int = 18) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+
+    done = max(0, min(done, total))
+    filled = round(width * done / total)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def elapsed_since(started_at: float) -> float:
+    return max(0.001, datetime.now().timestamp() - started_at)
+
+
+def estimate_remaining(done: int, total: int, elapsed: float) -> float | None:
+    if done <= 0 or total <= done:
+        return 0.0 if total <= done else None
+    rate = done / elapsed
+    if rate <= 0:
+        return None
+    return (total - done) / rate
 
 
 def load_json(path: Path, default: Any, *, strict: bool = False) -> Any:
@@ -487,11 +535,23 @@ def list_selectable_mailboxes(connection: imaplib.IMAP4_SSL) -> list[Mailbox]:
     return mailboxes
 
 
-def search_uids(connection: imaplib.IMAP4_SSL, *, start_uid: int | None = None) -> list[bytes]:
-    if start_uid is None:
+def search_uids(
+    connection: imaplib.IMAP4_SSL,
+    *,
+    start_uid: int | None = None,
+    end_uid: int | None = None,
+) -> list[bytes]:
+    if end_uid is not None and end_uid < 1:
+        return []
+
+    if start_uid is None and end_uid is None:
         status, data = connection.uid("SEARCH", None, "ALL")
-    else:
+    elif start_uid is not None and end_uid is not None:
+        status, data = connection.uid("SEARCH", None, "UID", f"{start_uid}:{end_uid}")
+    elif start_uid is not None:
         status, data = connection.uid("SEARCH", None, "UID", f"{start_uid}:*")
+    else:
+        status, data = connection.uid("SEARCH", None, "UID", f"1:{end_uid}")
 
     if status != "OK":
         raise RuntimeError(f"Could not search selected mailbox: {data!r}")
@@ -832,6 +892,10 @@ def max_uid_value(uids: list[bytes]) -> int:
     return max(int(uid) for uid in uids)
 
 
+def min_uid_value(uids: list[bytes]) -> int:
+    return min(int(uid) for uid in uids)
+
+
 def restore_existing_labels(replacement: dict[str, Any], previous_entry: dict[str, Any] | None) -> None:
     if previous_entry is None:
         return
@@ -933,6 +997,7 @@ def download_pending_messages(
     result_queue: Queue[DownloadOutcome] = Queue()
     outcomes: list[DownloadOutcome] = []
     downloaded_bytes = 0
+    started_at = datetime.now().timestamp()
 
     threads = [
         Thread(
@@ -950,20 +1015,24 @@ def download_pending_messages(
     for _ in threads:
         task_queue.put(None)
 
-    status.update(
-        f"{mailbox.display_name}: downloading 0/{len(pending_items)} messages with {worker_count} workers",
-        force=True,
-    )
+    status.update(download_progress_message(mailbox.display_name, 0, len(pending_items), 0, started_at, worker_count), force=True)
 
     while len(outcomes) < len(pending_items):
         outcome = result_queue.get()
         outcomes.append(outcome)
         if outcome.byte_size is not None:
             downloaded_bytes += outcome.byte_size
+        completed = len(outcomes)
         status.update(
-            f"{mailbox.display_name}: downloaded {len(outcomes)}/{len(pending_items)} pending messages "
-            f"({format_bytes(downloaded_bytes)})",
-            force=True,
+            download_progress_message(
+                mailbox.display_name,
+                completed,
+                len(pending_items),
+                downloaded_bytes,
+                started_at,
+                worker_count,
+            ),
+            force=completed == len(pending_items),
         )
 
     task_queue.join()
@@ -971,6 +1040,48 @@ def download_pending_messages(
         thread.join()
 
     return outcomes
+
+
+def download_progress_message(
+    mailbox_name: str,
+    completed: int,
+    total: int,
+    downloaded_bytes: int,
+    started_at: float,
+    worker_count: int,
+) -> str:
+    elapsed = elapsed_since(started_at)
+    eta = estimate_remaining(completed, total, elapsed)
+    message_rate = completed / elapsed
+    byte_rate = int(downloaded_bytes / elapsed)
+    return (
+        f"{mailbox_name} {progress_bar(completed, total)} downloads {completed}/{total} "
+        f"| {format_bytes(downloaded_bytes)} | {message_rate:.1f}/s | {format_bytes(byte_rate)}/s "
+        f"| elapsed {format_duration(elapsed)} | ETA {format_duration(eta)} | {worker_count} workers"
+    )
+
+
+def mailbox_progress_message(
+    mailbox_name: str,
+    processed: int,
+    total: int,
+    started_at: float,
+    stats: dict[str, int],
+    baseline: dict[str, int],
+) -> str:
+    elapsed = elapsed_since(started_at)
+    eta = estimate_remaining(processed, total, elapsed)
+    downloaded = stats["downloaded"] + stats["restored_missing"] - baseline["downloaded_total"]
+    downloaded_bytes = stats["downloaded_bytes"] - baseline["downloaded_bytes"]
+    errors = stats["errors"] - baseline["errors"]
+    uid_rate = processed / elapsed
+    byte_rate = int(downloaded_bytes / elapsed)
+    return (
+        f"{mailbox_name} {progress_bar(processed, total)} UIDs {processed}/{total} "
+        f"| new {downloaded} | {format_bytes(downloaded_bytes)} | {uid_rate:.1f} uid/s "
+        f"| {format_bytes(byte_rate)}/s | elapsed {format_duration(elapsed)} "
+        f"| ETA {format_duration(eta)} | err {errors}"
+    )
 
 
 def sync_mailbox(
@@ -988,38 +1099,74 @@ def sync_mailbox(
     message_count, uidvalidity = select_mailbox(connection, mailbox)
     state = mailbox_state(index, mailbox.display_name)
     last_seen_uid = int_from_state(state.get("last_seen_uid"))
-    can_resume = (
-        not force_full_scan
-        and uidvalidity is not None
-        and state.get("uidvalidity") == uidvalidity
-        and last_seen_uid is not None
-    )
-    start_uid = last_seen_uid + 1 if can_resume else None
+    backfill_before_uid = int_from_state(state.get("backfill_before_uid"))
+    same_uidvalidity = uidvalidity is not None and state.get("uidvalidity") == uidvalidity
+    backfill_complete = bool(state.get("backfill_complete"))
 
-    if can_resume:
-        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, resuming after UID {last_seen_uid})")
+    sync_mode = "full"
+    start_uid: int | None = None
+    end_uid: int | None = None
+
+    if not force_full_scan and same_uidvalidity and backfill_complete and last_seen_uid is not None:
+        sync_mode = "incremental"
+        start_uid = last_seen_uid + 1
+        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, checking newer than UID {last_seen_uid})")
+    elif not force_full_scan and same_uidvalidity and not backfill_complete and backfill_before_uid is not None:
+        sync_mode = "backfill"
+        end_uid = backfill_before_uid - 1
+        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, continuing backfill before UID {backfill_before_uid})")
     else:
-        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, full scan)")
+        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, full newest-first scan)")
 
-    uids = search_uids(connection, start_uid=start_uid)
+    uids = search_uids(connection, start_uid=start_uid, end_uid=end_uid)
     messages: dict[str, dict[str, Any]] = index["messages"]
     dirty_count = 0
 
     if not uids:
         if uidvalidity is not None:
             state["uidvalidity"] = uidvalidity
+        if sync_mode in {"full", "backfill"}:
+            scan_highest_uid = int_from_state(state.get("scan_highest_uid"))
+            if scan_highest_uid is not None:
+                state["last_seen_uid"] = scan_highest_uid
+            elif last_seen_uid is None:
+                state["last_seen_uid"] = 0
+            state["backfill_complete"] = True
+            state.pop("backfill_before_uid", None)
+            state.pop("scan_highest_uid", None)
         state["last_completed_at"] = iso_now()
         save_message_index(email_root / "_state" / "message_index.json", index)
         status.line(f"  No new messages in {mailbox.display_name}")
         return
 
+    if sync_mode == "full":
+        state["backfill_complete"] = False
+        state["scan_highest_uid"] = max_uid_value(uids)
+        state.pop("backfill_before_uid", None)
+
+    mailbox_started_at = datetime.now().timestamp()
+    baseline = {
+        "downloaded_total": stats["downloaded"] + stats["restored_missing"],
+        "downloaded_bytes": stats["downloaded_bytes"],
+        "errors": stats["errors"],
+    }
+    status.update(mailbox_progress_message(mailbox.display_name, 0, len(uids), mailbox_started_at, stats, baseline), force=True)
+
     for batch_number, uid_batch in enumerate(batched(uids, METADATA_BATCH_SIZE), start=1):
         batch_failed = False
         pending_downloads: list[PendingDownload] = []
+        processed_before_batch = min((batch_number - 1) * METADATA_BATCH_SIZE, len(uids))
 
         status.update(
-            f"{mailbox.display_name}: reading metadata batch {batch_number} "
-            f"({min(batch_number * METADATA_BATCH_SIZE, len(uids))}/{len(uids)} UIDs)",
+            mailbox_progress_message(
+                mailbox.display_name,
+                processed_before_batch,
+                len(uids),
+                mailbox_started_at,
+                stats,
+                baseline,
+            )
+            + " | metadata",
             force=True,
         )
 
@@ -1169,14 +1316,23 @@ def sync_mailbox(
 
         if uidvalidity is not None:
             state["uidvalidity"] = uidvalidity
-        state["last_seen_uid"] = max_uid_value(uid_batch)
+        if sync_mode == "incremental":
+            state["last_seen_uid"] = max(max_uid_value(uid_batch), last_seen_uid or 0)
+            state["backfill_complete"] = True
+        else:
+            state["backfill_before_uid"] = min_uid_value(uid_batch)
         state["last_completed_at"] = iso_now()
         dirty_count += 1
 
         status.update(
-            f"{mailbox.display_name}: done {min(batch_number * METADATA_BATCH_SIZE, len(uids))}/{len(uids)} UIDs "
-            f"downloaded={stats['downloaded']} restored={stats['restored_missing']} "
-            f"bytes={format_bytes(stats['downloaded_bytes'])} skipped={stats['skipped']} errors={stats['errors']}",
+            mailbox_progress_message(
+                mailbox.display_name,
+                min(batch_number * METADATA_BATCH_SIZE, len(uids)),
+                len(uids),
+                mailbox_started_at,
+                stats,
+                baseline,
+            ),
             force=True,
         )
 
@@ -1185,6 +1341,17 @@ def sync_mailbox(
             dirty_count = 0
 
     if dirty_count:
+        save_message_index(email_root / "_state" / "message_index.json", index)
+    if sync_mode in {"full", "backfill"}:
+        scan_highest_uid = int_from_state(state.get("scan_highest_uid"))
+        if scan_highest_uid is not None:
+            state["last_seen_uid"] = scan_highest_uid
+        elif uids:
+            state["last_seen_uid"] = max_uid_value(uids)
+        state["backfill_complete"] = True
+        state.pop("backfill_before_uid", None)
+        state.pop("scan_highest_uid", None)
+        state["last_completed_at"] = iso_now()
         save_message_index(email_root / "_state" / "message_index.json", index)
     status.line(f"  Completed {mailbox.display_name}: {len(uids)} UIDs checked")
 
