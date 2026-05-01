@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
-from threading import Thread
+from threading import RLock, Thread
 from typing import Any, Callable
 
 
@@ -42,6 +42,7 @@ RESERVED_IMAP_CONNECTIONS = 2
 MAIN_IMAP_CONNECTIONS = 1
 MAX_DOWNLOAD_WORKERS = max(1, GMAIL_IMAP_CONNECTION_LIMIT - RESERVED_IMAP_CONNECTIONS - MAIN_IMAP_CONNECTIONS)
 STATUS_REFRESH_SECONDS = 0.2
+STATUS_ANIMATION_SECONDS = 0.35
 RAW_FILE_RE = re.compile(r"__(?P<gmail_msg_id>\d+)\.eml$")
 RETRYABLE_GMAIL_ERROR_PATTERNS = (
     "too many simultaneous",
@@ -185,31 +186,48 @@ class LiveStatus:
         self.dynamic = sys.stdout.isatty() and os.environ.get("TERM", "dumb").lower() != "dumb"
         self.last_lines: list[str] = []
         self.last_update = 0.0
+        self.current_message = ""
+        self.animation_frame = 0
+        self.animation_generation = 0
+        self.animation_thread: Thread | None = None
+        self.lock = RLock()
 
     def update(self, message: str, *, force: bool = False) -> None:
         now = datetime.now().timestamp()
         if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
             return
-        self.last_update = now
-        if self.dynamic:
-            lines = self.fit_lines(message)
-            self.clear_dynamic()
-            print("\n".join(lines), end="", flush=True)
-            self.last_lines = lines
-        else:
-            print(message, flush=True)
+
+        with self.lock:
+            self.last_update = now
+            self.current_message = message
+            self.animation_frame = 0
+            self.animation_generation += 1
+            if self.dynamic:
+                self.render_dynamic_locked(self.render_animation(message))
+                if "..." in message:
+                    self.start_animation_locked(self.animation_generation)
+            else:
+                print(message, flush=True)
 
     def line(self, message: str = "") -> None:
-        self.clear_dynamic()
+        with self.lock:
+            self.animation_generation += 1
+            self.clear_dynamic_locked()
         if message:
             print(message, flush=True)
 
     def done(self) -> None:
-        if self.dynamic and self.last_lines:
-            print()
-            self.last_lines = []
+        with self.lock:
+            self.animation_generation += 1
+            if self.dynamic and self.last_lines:
+                print()
+                self.last_lines = []
 
     def clear_dynamic(self) -> None:
+        with self.lock:
+            self.clear_dynamic_locked()
+
+    def clear_dynamic_locked(self) -> None:
         if not self.dynamic or not self.last_lines:
             return
 
@@ -218,33 +236,50 @@ class LiveStatus:
             print("\x1b[1A\r\x1b[2K", end="")
         self.last_lines = []
 
+    def render_dynamic_locked(self, message: str) -> None:
+        lines = self.fit_lines(message)
+        self.clear_dynamic_locked()
+        print("\n".join(lines), end="", flush=True)
+        self.last_lines = lines
+
+    def render_animation(self, message: str) -> str:
+        if "..." not in message:
+            return message
+        dots = "." * (self.animation_frame + 1)
+        return message.replace("...", dots)
+
+    def start_animation_locked(self, generation: int) -> None:
+        self.animation_thread = Thread(target=self.animate, args=(generation,), daemon=True)
+        self.animation_thread.start()
+
+    def animate(self, generation: int) -> None:
+        while True:
+            time.sleep(STATUS_ANIMATION_SECONDS)
+            with self.lock:
+                if (
+                    generation != self.animation_generation
+                    or not self.dynamic
+                    or "..." not in self.current_message
+                    or not self.last_lines
+                ):
+                    return
+                self.animation_frame = (self.animation_frame + 1) % 3
+                self.render_dynamic_locked(self.render_animation(self.current_message))
+
     def fit_lines(self, message: str) -> list[str]:
+        raw_lines = message.splitlines() or [""]
         if not self.dynamic:
-            return [message]
+            return raw_lines
 
         columns = shutil.get_terminal_size((120, 20)).columns
         limit = max(40, columns - 1)
-        if len(message) <= limit:
-            return [message]
-
-        parts = message.split(" | ")
-        first_line = parts[0]
-        second_parts: list[str] = []
-        for part in parts[1:]:
-            candidate = first_line + " | " + part
-            if not second_parts and len(candidate) <= limit:
-                first_line = candidate
+        lines: list[str] = []
+        for line in raw_lines:
+            if len(line) <= limit:
+                lines.append(line)
             else:
-                second_parts.append(part)
-
-        if len(first_line) > limit:
-            first_line = first_line[: limit - 4].rstrip() + " ..."
-
-        second_line = "  " + " | ".join(second_parts) if second_parts else ""
-        if second_line and len(second_line) > limit:
-            second_line = second_line[: limit - 4].rstrip() + " ..."
-
-        return [first_line, second_line] if second_line else [first_line]
+                lines.append(line[: limit - 4].rstrip() + " ...")
+        return lines
 
 
 class CompactHelpParser(argparse.ArgumentParser):
@@ -1566,16 +1601,18 @@ def total_progress_message(stats: dict[str, int], started_at: float, activity: s
     eta = estimate_remaining(done, total, elapsed)
     byte_rate = int(stats["downloaded_bytes"] / elapsed)
     downloaded = stats["downloaded"] + stats["restored_missing"]
-    activity_detail = f" | {activity}" if activity else ""
-    retry_detail = f" | {format_int(stats['download_retries'])} retries" if stats["download_retries"] else ""
+    current = activity or "checking for missing emails..."
 
-    return (
-        f"Total {progress_percent(done, total)} {progress_bar(done, total)} "
-        f"| {format_int(done)} of {format_int(total)} archived "
-        f"| {format_int(downloaded)} new "
-        f"| {format_bytes(stats['downloaded_bytes'])} at {format_bytes(byte_rate)}/s "
-        f"| {format_duration(elapsed)} elapsed | about {format_duration(eta)} left"
-        f"{activity_detail}{retry_detail}"
+    return "\n".join(
+        [
+            "Gmail Downloader",
+            f"{progress_bar(done, total)} {progress_percent(done, total).strip()}  "
+            f"{format_int(done)} / {format_int(total)} emails archived",
+            f"Downloaded {format_int(downloaded)} new emails, {format_bytes(stats['downloaded_bytes'])}",
+            f"Speed {format_bytes(byte_rate)}/s    Elapsed {format_duration(elapsed)}    "
+            f"Left about {format_duration(eta)}",
+            f"Current: {current}",
+        ]
     )
 
 
@@ -1591,7 +1628,7 @@ def download_activity(
     if expected_bytes > 0:
         byte_progress += f"/{format_bytes(expected_bytes)}"
 
-    return f"downloading {format_int(completed)} of {format_int(total)} | batch {byte_progress}"
+    return f"downloading {format_int(completed)} of {format_int(total)} in active batch ({byte_progress})"
 
 
 def print_summary_section(title: str, rows: list[tuple[str, str]]) -> None:
@@ -1741,7 +1778,7 @@ def sync_mailbox(
         state["scan_highest_uid"] = max_uid_value(uids)
         state["backfill_before_uid"] = None
 
-    status.update(total_progress_message(stats, operation_started_at, "checking metadata"), force=True)
+    status.update(total_progress_message(stats, operation_started_at, "checking email details..."), force=True)
 
     offset = 0
     while offset < len(uids):
@@ -1756,7 +1793,7 @@ def sync_mailbox(
         newly_archived_without_download = 0
 
         status.update(
-            total_progress_message(stats, operation_started_at, f"checking metadata {format_int(len(uid_batch))}"),
+            total_progress_message(stats, operation_started_at, f"checking {format_int(len(uid_batch))} email details..."),
             force=True,
         )
 
@@ -1888,7 +1925,7 @@ def sync_mailbox(
 
         if newly_archived_without_download:
             mark_work_done(stats, newly_archived_without_download)
-            status.update(total_progress_message(stats, operation_started_at, "checking metadata"), force=False)
+            status.update(total_progress_message(stats, operation_started_at, "checking email details..."), force=False)
 
         def on_download_progress(activity: str) -> None:
             status.update(total_progress_message(stats, operation_started_at, activity), force=False)
@@ -2047,7 +2084,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         indexed_message_count = state_store.count_messages()
 
         plans: list[MailboxPlan] = []
-        status.update("Preparing mailbox scan ...", force=True)
+        status.update(total_progress_message(stats, operation_started_at, "preparing account scan..."), force=True)
         for mailbox in mailboxes:
             try:
                 plan = build_mailbox_plan(
@@ -2061,7 +2098,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
                 stats["work_total"] = stats["account_message_total"]
                 stats["work_done"] = min(indexed_message_count, stats["work_total"])
                 status.update(
-                    total_progress_message(stats, operation_started_at, "preparing scan"),
+                    total_progress_message(stats, operation_started_at, "preparing account scan..."),
                     force=False,
                 )
             except Exception as exc:
