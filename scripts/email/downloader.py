@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 
@@ -45,6 +45,7 @@ MAIN_IMAP_CONNECTIONS = 1
 MAX_DOWNLOAD_WORKERS = max(1, GMAIL_IMAP_CONNECTION_LIMIT - RESERVED_IMAP_CONNECTIONS - MAIN_IMAP_CONNECTIONS)
 STATUS_REFRESH_SECONDS = 0.08
 STATUS_ANIMATION_SECONDS = 0.25
+STATUS_HEARTBEAT_SECONDS = 0.25
 ETA_MIN_SAMPLE_SECONDS = 5.0
 ETA_MIN_SAMPLE_MESSAGES = 20
 ETA_SMOOTHING_ALPHA = 0.35
@@ -1916,6 +1917,80 @@ def total_progress_message(stats: dict[str, Any], started_at: float, activity: s
     )
 
 
+class ProgressDisplay:
+    def __init__(self, status: LiveStatus, stats: dict[str, Any], started_at: float) -> None:
+        self.status = status
+        self.stats = stats
+        self.started_at = started_at
+        self.activity = "checking for missing emails..."
+        self.last_message = ""
+        self.stop_event = Event()
+        self.thread: Thread | None = None
+        self.lock = RLock()
+
+    def start(self) -> None:
+        if not self.status.dynamic or self.thread is not None:
+            return
+
+        self.thread = Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def update(self, activity: str | None = None, *, force: bool = False) -> None:
+        with self.lock:
+            if activity is not None:
+                self.activity = activity
+            self.render_locked(force=force)
+
+    def render_locked(self, *, force: bool = False) -> None:
+        message = total_progress_message(self.stats, self.started_at, self.activity)
+        if not force and message == self.last_message:
+            return
+
+        self.last_message = message
+        self.status.update(message, force=force)
+
+    def run(self) -> None:
+        while not self.stop_event.wait(STATUS_HEARTBEAT_SECONDS):
+            with self.lock:
+                self.render_locked(force=False)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+
+def initial_stats() -> dict[str, Any]:
+    return {
+        "downloaded": 0,
+        "downloaded_bytes": 0,
+        "skipped": 0,
+        "restored_missing": 0,
+        "repaired_corrupt": 0,
+        "corrupt_found": 0,
+        "indexed_existing": 0,
+        "labels_merged": 0,
+        "errors": 0,
+        "download_workers": DEFAULT_DOWNLOAD_WORKERS,
+        "worker_backoffs": 0,
+        "download_retries": 0,
+        "worker_reconnects": 0,
+        "metadata_batch_size": DEFAULT_METADATA_BATCH_SIZE,
+        "metadata_batch_backoffs": 0,
+        "metadata_batch_growths": 0,
+        "metadata_batch_successes": 0,
+        "work_done": 0,
+        "work_total": 0,
+        "account_message_total": 0,
+        "active_downloaded": 0,
+        "active_downloaded_bytes": 0,
+        "active_archived": 0,
+        "eta_started_at": 0.0,
+        "eta_baseline_done": 0,
+        "eta_smoothed_remaining": None,
+    }
+
+
 def download_activity(
     completed: int,
     total: int,
@@ -2052,16 +2127,16 @@ def plan_mailboxes_concurrently(
     state_store: StateStore,
     force_full_scan: bool,
     indexed_message_count: int,
-    stats: dict[str, int],
+    stats: dict[str, Any],
     status: LiveStatus,
-    operation_started_at: float,
+    progress: ProgressDisplay,
 ) -> list[MailboxPlan]:
     mailbox_states = {mailbox.display_name: state_store.get_mailbox_state(mailbox.display_name) for mailbox in mailboxes}
     worker_count = max(1, min(DEFAULT_DOWNLOAD_WORKERS, len(mailboxes)))
     remaining = mailboxes
     plans_by_name: dict[str, MailboxPlan] = {}
 
-    status.update(total_progress_message(stats, operation_started_at, "preparing account scan..."), force=True)
+    progress.update("preparing account scan...", force=True)
 
     while remaining:
         retry_mailboxes: list[Mailbox] = []
@@ -2099,10 +2174,7 @@ def plan_mailboxes_concurrently(
                 stats["account_message_total"] = max(stats["account_message_total"], plan.message_count)
                 stats["work_total"] = stats["account_message_total"]
                 stats["work_done"] = min(indexed_message_count, stats["work_total"])
-                status.update(
-                    total_progress_message(stats, operation_started_at, "preparing account scan..."),
-                    force=False,
-                )
+                progress.update("preparing account scan...", force=False)
 
         if not retry_mailboxes:
             break
@@ -2133,9 +2205,9 @@ def sync_mailbox(
     email_root: Path,
     existing_files: dict[str, Path],
     state_store: StateStore,
-    stats: dict[str, int],
+    stats: dict[str, Any],
     status: LiveStatus,
-    operation_started_at: float,
+    progress: ProgressDisplay,
 ) -> None:
     mailbox = plan.mailbox
     raw_dir = email_root / "raw"
@@ -2172,7 +2244,7 @@ def sync_mailbox(
         state["scan_highest_uid"] = max_uid_value(uids)
         state["backfill_before_uid"] = None
 
-    status.update(total_progress_message(stats, operation_started_at, "checking email details..."), force=True)
+    progress.update("checking email details...", force=True)
 
     metadata_prefetcher = MetadataPrefetcher(credentials, mailbox)
     download_manager = DownloadPoolManager(credentials, mailbox)
@@ -2196,10 +2268,7 @@ def sync_mailbox(
         pending_downloads: list[PendingDownload] = []
         newly_archived_without_download = 0
 
-        status.update(
-            total_progress_message(stats, operation_started_at, f"checking {format_int(len(uid_batch))} email details..."),
-            force=True,
-        )
+        progress.update(f"checking {format_int(len(uid_batch))} email details...", force=True)
 
         try:
             metadata_by_uid = metadata_job.future.result()
@@ -2397,10 +2466,10 @@ def sync_mailbox(
 
         if newly_archived_without_download:
             mark_work_done(stats, newly_archived_without_download)
-            status.update(total_progress_message(stats, operation_started_at, "checking email details..."), force=False)
+            progress.update("checking email details...", force=False)
 
         def on_download_progress(activity: str, force: bool = False) -> None:
-            status.update(total_progress_message(stats, operation_started_at, activity), force=force)
+            progress.update(activity, force=force)
 
         outcomes = download_with_adaptive_workers(
             credentials,
@@ -2456,7 +2525,7 @@ def sync_mailbox(
                 mark_work_done(stats)
             dirty_count += 1
 
-        status.update(total_progress_message(stats, operation_started_at), force=True)
+        progress.update(force=True)
 
         if batch_failed:
             state_store.commit()
@@ -2492,7 +2561,7 @@ def sync_mailbox(
                     stats["metadata_batch_growths"] += 1
                 stats["metadata_batch_successes"] = 0
 
-        status.update(total_progress_message(stats, operation_started_at), force=True)
+        progress.update(force=True)
 
         if dirty_count >= DB_COMMIT_EVERY:
             state_store.commit()
@@ -2535,40 +2604,16 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
     (email_root / "_state").mkdir(parents=True, exist_ok=True)
     (email_root / "raw").mkdir(parents=True, exist_ok=True)
     status = LiveStatus()
-
-    removed_part_files, existing_files = run_startup_file_tasks(email_root)
-
-    state_store = StateStore(email_root)
+    operation_started_at = datetime.now().timestamp()
+    stats = initial_stats()
+    progress = ProgressDisplay(status, stats, operation_started_at)
+    progress.update("preparing local archive...", force=True)
+    progress.start()
+    state_store: StateStore | None = None
     try:
-        operation_started_at = datetime.now().timestamp()
-        stats = {
-            "downloaded": 0,
-            "downloaded_bytes": 0,
-            "skipped": 0,
-            "restored_missing": 0,
-            "repaired_corrupt": 0,
-            "corrupt_found": 0,
-            "indexed_existing": 0,
-            "labels_merged": 0,
-            "errors": 0,
-            "download_workers": DEFAULT_DOWNLOAD_WORKERS,
-            "worker_backoffs": 0,
-            "download_retries": 0,
-            "worker_reconnects": 0,
-            "metadata_batch_size": DEFAULT_METADATA_BATCH_SIZE,
-            "metadata_batch_backoffs": 0,
-            "metadata_batch_growths": 0,
-            "metadata_batch_successes": 0,
-            "work_done": 0,
-            "work_total": 0,
-            "account_message_total": 0,
-            "active_downloaded": 0,
-            "active_downloaded_bytes": 0,
-            "active_archived": 0,
-            "eta_started_at": 0.0,
-            "eta_baseline_done": 0,
-            "eta_smoothed_remaining": None,
-        }
+        removed_part_files, existing_files = run_startup_file_tasks(email_root)
+        state_store = StateStore(email_root)
+        progress.update("preparing account scan...", force=True)
 
         mailboxes = list_selectable_mailboxes(connection)
         if not mailboxes:
@@ -2584,11 +2629,11 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             indexed_message_count,
             stats,
             status,
-            operation_started_at,
+            progress,
         )
         reset_eta_sample(stats)
 
-        status.update(total_progress_message(stats, operation_started_at), force=True)
+        progress.update(force=True)
 
         processed_mailboxes: list[str] = []
         for plan in plans:
@@ -2602,7 +2647,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
                     state_store,
                     stats,
                     status,
-                    operation_started_at,
+                    progress,
                 )
                 processed_mailboxes.append(plan.mailbox.display_name)
             except Exception as exc:
@@ -2628,8 +2673,10 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         summary.pop("eta_smoothed_remaining", None)
         return summary
     finally:
+        progress.stop()
         status.done()
-        state_store.close()
+        if state_store is not None:
+            state_store.close()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
