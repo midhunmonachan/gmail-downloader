@@ -16,7 +16,7 @@ import socket
 import sqlite3
 import sys
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +49,8 @@ STATUS_HEARTBEAT_SECONDS = 0.25
 ETA_MIN_SAMPLE_SECONDS = 5.0
 ETA_MIN_SAMPLE_MESSAGES = 20
 ETA_SMOOTHING_ALPHA = 0.35
+TRANSFER_RATE_SMOOTHING_ALPHA = 0.45
+TRANSFER_RATE_IDLE_SECONDS = 3.0
 RAW_FILE_RE = re.compile(r"__(?P<gmail_msg_id>\d+)\.eml$")
 RETRYABLE_GMAIL_ERROR_PATTERNS = (
     "too many simultaneous",
@@ -518,6 +520,22 @@ def cleanup_part_files(email_root: Path) -> int:
     return removed
 
 
+def run_daemon_task(function: Callable[..., Any], *args: Any) -> Future:
+    future: Future = Future()
+
+    def runner() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+
+        try:
+            future.set_result(function(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+
+    Thread(target=runner, daemon=True).start()
+    return future
+
+
 def normalize_app_password(app_password: str) -> str:
     return "".join(app_password.split())
 
@@ -893,10 +911,14 @@ def build_existing_file_lookup(raw_dir: Path) -> dict[str, Path]:
 
 
 def run_startup_file_tasks(email_root: Path) -> tuple[int, dict[str, Path]]:
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="gmail-startup") as executor:
-        cleanup_future = executor.submit(cleanup_part_files, email_root)
-        lookup_future = executor.submit(build_existing_file_lookup, email_root / "raw")
+    cleanup_future = run_daemon_task(cleanup_part_files, email_root)
+    lookup_future = run_daemon_task(build_existing_file_lookup, email_root / "raw")
+    try:
         return cleanup_future.result(), lookup_future.result()
+    except KeyboardInterrupt:
+        cleanup_future.cancel()
+        lookup_future.cancel()
+        raise
 
 
 def find_existing_message_file(existing_files: dict[str, Path], gmail_msg_id: str) -> Path | None:
@@ -1426,41 +1448,66 @@ class MetadataPrefetcher:
         self.credentials = credentials
         self.mailbox = mailbox
         self.connection: imaplib.IMAP4_SSL | None = None
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gmail-metadata")
+        self.task_queue: Queue[tuple[list[bytes], Future] | None] = Queue()
         self.closed = False
+        self.lock = RLock()
+        self.thread = Thread(target=self.run, daemon=True)
+        self.thread.start()
 
     def submit(self, uids: list[bytes]) -> Future:
-        return self.executor.submit(self.fetch, list(uids))
+        future: Future = Future()
+        with self.lock:
+            if self.closed:
+                future.set_exception(RuntimeError("metadata prefetcher is closed"))
+                return future
+            self.task_queue.put((list(uids), future))
+        return future
 
-    def fetch(self, uids: list[bytes]) -> dict[bytes, MessageMetadata]:
+    def run(self) -> None:
         try:
-            if self.connection is None:
-                self.connection = open_worker_connection(self.credentials, self.mailbox)
-            return fetch_metadata_batch(self.connection, uids)
-        except Exception:
+            while True:
+                job = self.task_queue.get()
+                try:
+                    if job is None:
+                        return
+
+                    uids, future = job
+                    if self.closed:
+                        future.cancel()
+                        continue
+                    if not future.set_running_or_notify_cancel():
+                        continue
+
+                    try:
+                        if self.connection is None:
+                            self.connection = open_worker_connection(self.credentials, self.mailbox)
+                        future.set_result(fetch_metadata_batch(self.connection, uids))
+                    except BaseException as exc:
+                        close_connection(self.connection)
+                        self.connection = None
+                        future.set_exception(exc)
+                finally:
+                    self.task_queue.task_done()
+        finally:
             close_connection(self.connection)
             self.connection = None
-            raise
 
-    def close(self) -> None:
-        if self.closed:
-            return
+    def close(self, *, wait: bool = False, timeout: float = 1.0) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.task_queue.put(None)
 
-        self.closed = True
+        close_connection(self.connection)
+        if wait and self.thread.is_alive():
+            self.thread.join(timeout=timeout)
+
+    def __del__(self) -> None:
         try:
-            close_future = self.executor.submit(self.close_on_worker)
-        except RuntimeError:
-            return
-
-        self.executor.shutdown(wait=True)
-        try:
-            close_future.result()
+            self.close(wait=False)
         except Exception:
             pass
-
-    def close_on_worker(self) -> None:
-        close_connection(self.connection)
-        self.connection = None
 
 
 def schedule_metadata_batch(
@@ -1701,16 +1748,18 @@ class DownloadWorkerPool:
         self.task_queue.join()
         return outcomes
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = False, timeout: float = 1.0) -> None:
         if self.closed:
             return
 
         self.closed = True
         for _ in self.threads:
             self.task_queue.put(None)
-        self.task_queue.join()
-        for thread in self.threads:
-            thread.join()
+        if wait:
+            deadline = time.monotonic() + timeout
+            for thread in self.threads:
+                remaining = max(0.0, deadline - time.monotonic())
+                thread.join(timeout=remaining)
 
 
 class DownloadPoolManager:
@@ -1730,10 +1779,10 @@ class DownloadPoolManager:
             self.pool = DownloadWorkerPool(self.credentials, self.mailbox, worker_count)
         return self.pool.download(pending_items, progress_callback=progress_callback)
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = False) -> None:
         if self.pool is None:
             return
-        self.pool.close()
+        self.pool.close(wait=wait)
         self.pool = None
 
 
@@ -1749,10 +1798,14 @@ def download_pending_messages(
 
     worker_count = max(1, min(worker_count, len(pending_items)))
     pool = DownloadWorkerPool(credentials, mailbox, worker_count)
+    interrupted = False
     try:
         return pool.download(pending_items, progress_callback=progress_callback)
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
     finally:
-        pool.close()
+        pool.close(wait=not interrupted)
 
 
 def download_with_adaptive_workers(
@@ -1760,7 +1813,7 @@ def download_with_adaptive_workers(
     mailbox: Mailbox,
     pending_items: list[PendingDownload],
     status: LiveStatus,
-    stats: dict[str, int],
+    stats: dict[str, Any],
     download_manager: DownloadPoolManager | None = None,
     progress_callback: Callable[[str, bool], None] | None = None,
 ) -> list[DownloadOutcome]:
@@ -1856,7 +1909,7 @@ def download_with_adaptive_workers(
     return completed
 
 
-def mark_work_done(stats: dict[str, int], count: int = 1) -> None:
+def mark_work_done(stats: dict[str, Any], count: int = 1) -> None:
     if count <= 0:
         return
     total = stats.get("work_total", 0)
@@ -1882,20 +1935,66 @@ def smoothed_eta(stats: dict[str, Any], raw_eta: float | None) -> float | None:
     return raw_eta
 
 
+def recent_transfer_rate(stats: dict[str, Any], downloaded_bytes: int, now: float) -> float | None:
+    last_at = stats.get("transfer_rate_last_at")
+    last_bytes = stats.get("transfer_rate_last_bytes")
+    if not isinstance(last_at, (int, float)) or not isinstance(last_bytes, int) or last_at <= 0:
+        stats["transfer_rate_last_at"] = now
+        stats["transfer_rate_last_bytes"] = downloaded_bytes
+        stats["transfer_rate_last_progress_at"] = now if downloaded_bytes > 0 else 0.0
+        return None
+
+    elapsed = max(0.001, now - float(last_at))
+    byte_delta = downloaded_bytes - last_bytes
+    if byte_delta > 0:
+        instant_rate = byte_delta / elapsed
+        previous_rate = stats.get("transfer_rate_bytes_per_second")
+        if isinstance(previous_rate, (int, float)) and previous_rate > 0:
+            instant_rate = (
+                TRANSFER_RATE_SMOOTHING_ALPHA * instant_rate
+                + (1 - TRANSFER_RATE_SMOOTHING_ALPHA) * float(previous_rate)
+            )
+        stats["transfer_rate_bytes_per_second"] = instant_rate
+        stats["transfer_rate_last_at"] = now
+        stats["transfer_rate_last_bytes"] = downloaded_bytes
+        stats["transfer_rate_last_progress_at"] = now
+        return instant_rate
+
+    last_progress_at = stats.get("transfer_rate_last_progress_at", 0.0)
+    if isinstance(last_progress_at, (int, float)) and last_progress_at > 0:
+        if now - float(last_progress_at) < TRANSFER_RATE_IDLE_SECONDS:
+            rate = stats.get("transfer_rate_bytes_per_second")
+            return float(rate) if isinstance(rate, (int, float)) and rate > 0 else None
+
+    stats["transfer_rate_bytes_per_second"] = 0.0
+    stats["transfer_rate_last_at"] = now
+    stats["transfer_rate_last_bytes"] = downloaded_bytes
+    return 0.0 if downloaded_bytes > 0 else None
+
+
+def format_transfer_rate(rate: float | None) -> str:
+    if rate is None:
+        return "Transfer waiting for raw email data"
+    if rate <= 0:
+        return "Transfer idle"
+    return f"Transfer {format_bytes(int(rate))}/s"
+
+
 def total_progress_message(stats: dict[str, Any], started_at: float, activity: str = "") -> str:
+    now = datetime.now().timestamp()
     active_archived = stats.get("active_archived", 0)
     done = stats.get("work_done", 0) + active_archived
     total = stats.get("work_total", 0)
     if total > 0:
         done = min(done, total)
-    elapsed = elapsed_since(started_at)
+    elapsed = max(0.001, now - started_at)
     eta_started_at = stats.get("eta_started_at", 0)
     eta_baseline_done = stats.get("eta_baseline_done", done)
-    sample_elapsed = elapsed_since(eta_started_at) if isinstance(eta_started_at, (int, float)) and eta_started_at > 0 else 0
+    sample_elapsed = max(0.001, now - eta_started_at) if isinstance(eta_started_at, (int, float)) and eta_started_at > 0 else 0
     sample_done = max(0, done - eta_baseline_done) if isinstance(eta_baseline_done, int) else 0
     eta = smoothed_eta(stats, estimate_remaining(done, total, sample_done, sample_elapsed))
     downloaded_bytes = stats["downloaded_bytes"] + stats.get("active_downloaded_bytes", 0)
-    byte_rate = int(downloaded_bytes / elapsed)
+    transfer_rate = recent_transfer_rate(stats, downloaded_bytes, now)
     downloaded = (
         stats["downloaded"]
         + stats["restored_missing"]
@@ -1910,7 +2009,7 @@ def total_progress_message(stats: dict[str, Any], started_at: float, activity: s
             f"{progress_bar(done, total)} {progress_percent(done, total).strip()}  "
             f"{format_int(done)} / {format_int(total)} emails archived",
             f"Downloaded {format_int(downloaded)} emails, {format_bytes(downloaded_bytes)}",
-            f"Speed {format_bytes(byte_rate)}/s    Elapsed {format_duration(elapsed)}    "
+            f"{format_transfer_rate(transfer_rate)}    Elapsed {format_duration(elapsed)}    "
             f"Left {format_remaining(eta)}",
             f"Current: {current}",
         ]
@@ -1988,6 +2087,10 @@ def initial_stats() -> dict[str, Any]:
         "eta_started_at": 0.0,
         "eta_baseline_done": 0,
         "eta_smoothed_remaining": None,
+        "transfer_rate_last_at": 0.0,
+        "transfer_rate_last_bytes": 0,
+        "transfer_rate_last_progress_at": 0.0,
+        "transfer_rate_bytes_per_second": None,
     }
 
 
@@ -2121,6 +2224,60 @@ def build_mailbox_plan_worker(
         close_connection(connection)
 
 
+def build_mailbox_plan_batch(
+    credentials: Credentials,
+    mailboxes: list[Mailbox],
+    mailbox_states: dict[str, dict[str, Any]],
+    force_full_scan: bool,
+    worker_count: int,
+) -> list[tuple[Mailbox, MailboxPlan | None, str | None]]:
+    if not mailboxes:
+        return []
+
+    task_queue: Queue[Mailbox | None] = Queue()
+    result_queue: Queue[tuple[Mailbox, MailboxPlan | None, str | None]] = Queue()
+
+    def worker() -> None:
+        while True:
+            mailbox = task_queue.get()
+            try:
+                if mailbox is None:
+                    return
+
+                try:
+                    plan = build_mailbox_plan_worker(
+                        credentials,
+                        mailbox,
+                        mailbox_states[mailbox.display_name],
+                        force_full_scan,
+                    )
+                except Exception as exc:
+                    result_queue.put((mailbox, None, format_exception(exc)))
+                else:
+                    result_queue.put((mailbox, plan, None))
+            finally:
+                task_queue.task_done()
+
+    threads = [
+        Thread(target=worker, daemon=True)
+        for _ in range(max(1, min(worker_count, len(mailboxes))))
+    ]
+    for thread in threads:
+        thread.start()
+    for mailbox in mailboxes:
+        task_queue.put(mailbox)
+    for _ in threads:
+        task_queue.put(None)
+
+    results: list[tuple[Mailbox, MailboxPlan | None, str | None]] = []
+    while len(results) < len(mailboxes):
+        results.append(result_queue.get())
+
+    for thread in threads:
+        thread.join(timeout=1.0)
+    return results
+
+
 def plan_mailboxes_concurrently(
     credentials: Credentials,
     mailboxes: list[Mailbox],
@@ -2143,38 +2300,31 @@ def plan_mailboxes_concurrently(
         retry_errors: dict[str, str] = {}
         active_workers = max(1, min(worker_count, len(remaining)))
 
-        with ThreadPoolExecutor(max_workers=active_workers, thread_name_prefix="gmail-plan") as executor:
-            future_to_mailbox = {
-                executor.submit(
-                    build_mailbox_plan_worker,
-                    credentials,
-                    mailbox,
-                    mailbox_states[mailbox.display_name],
-                    force_full_scan,
-                ): mailbox
-                for mailbox in remaining
-            }
+        for mailbox, plan, error in build_mailbox_plan_batch(
+            credentials,
+            remaining,
+            mailbox_states,
+            force_full_scan,
+            active_workers,
+        ):
+            if error is not None:
+                if is_retryable_download_error(error):
+                    retry_mailboxes.append(mailbox)
+                    retry_errors[mailbox.display_name] = error
+                else:
+                    status.line()
+                    stats["errors"] += 1
+                    print(f"Mailbox planning error: {mailbox.display_name}: {error}")
+                continue
 
-            for future in as_completed(future_to_mailbox):
-                mailbox = future_to_mailbox[future]
-                try:
-                    plan = future.result()
-                except Exception as exc:
-                    error = format_exception(exc)
-                    if is_retryable_download_error(error):
-                        retry_mailboxes.append(mailbox)
-                        retry_errors[mailbox.display_name] = error
-                    else:
-                        status.line()
-                        stats["errors"] += 1
-                        print(f"Mailbox planning error: {mailbox.display_name}: {error}")
-                    continue
+            if plan is None:
+                continue
 
-                plans_by_name[mailbox.display_name] = plan
-                stats["account_message_total"] = max(stats["account_message_total"], plan.message_count)
-                stats["work_total"] = stats["account_message_total"]
-                stats["work_done"] = min(indexed_message_count, stats["work_total"])
-                progress.update("preparing account scan...", force=False)
+            plans_by_name[mailbox.display_name] = plan
+            stats["account_message_total"] = max(stats["account_message_total"], plan.message_count)
+            stats["work_total"] = stats["account_message_total"]
+            stats["work_done"] = min(indexed_message_count, stats["work_total"])
+            progress.update("preparing account scan...", force=False)
 
         if not retry_mailboxes:
             break
@@ -2671,6 +2821,10 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         summary.pop("eta_started_at", None)
         summary.pop("eta_baseline_done", None)
         summary.pop("eta_smoothed_remaining", None)
+        summary.pop("transfer_rate_last_at", None)
+        summary.pop("transfer_rate_last_bytes", None)
+        summary.pop("transfer_rate_last_progress_at", None)
+        summary.pop("transfer_rate_bytes_per_second", None)
         return summary
     finally:
         progress.stop()
