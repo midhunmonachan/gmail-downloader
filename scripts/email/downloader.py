@@ -25,12 +25,34 @@ IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT_SECONDS = 30
 APP_NAME = "gmail-downloader"
-METADATA_BATCH_SIZE = 100
+METADATA_BATCH_SIZE = 500
 GMAIL_IMAP_CONNECTION_LIMIT = 15
 RESERVED_IMAP_CONNECTIONS = 2
 MAIN_IMAP_CONNECTIONS = 1
 MAX_DOWNLOAD_WORKERS = max(1, GMAIL_IMAP_CONNECTION_LIMIT - RESERVED_IMAP_CONNECTIONS - MAIN_IMAP_CONNECTIONS)
 STATUS_REFRESH_SECONDS = 0.2
+RAW_FILE_RE = re.compile(r"__(?P<gmail_msg_id>\d+)\.eml$")
+RETRYABLE_GMAIL_ERROR_PATTERNS = (
+    "too many simultaneous",
+    "too many requests",
+    "too many concurrent requests for user",
+    "rate limit exceeded",
+    "user rate limit exceeded",
+    "backend error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+)
+RETRYABLE_NETWORK_ERROR_PATTERNS = (
+    "timeouterror:",
+    "socket.timeout:",
+    "connectionreseterror:",
+    "connectionabortederror:",
+    "brokenpipeerror:",
+    "imap abort:",
+    "socket error:",
+    "networkvalidationerror:",
+)
 
 
 def default_config_path() -> Path:
@@ -682,10 +704,24 @@ def filename_for_message(metadata: MessageMetadata) -> str:
     return f"{date_part}__{metadata.gmail_msg_id}.eml"
 
 
-def find_existing_message_file(raw_dir: Path, gmail_msg_id: str) -> Path | None:
-    matches = sorted(raw_dir.glob(f"*__{gmail_msg_id}.eml"))
-    if matches:
-        return matches[0]
+def build_existing_file_lookup(raw_dir: Path) -> dict[str, Path]:
+    lookup: dict[str, Path] = {}
+    if not raw_dir.exists():
+        return lookup
+
+    for path in raw_dir.glob("*.eml"):
+        match = RAW_FILE_RE.search(path.name)
+        if match:
+            lookup.setdefault(match.group("gmail_msg_id"), path)
+    return lookup
+
+
+def find_existing_message_file(existing_files: dict[str, Path], gmail_msg_id: str) -> Path | None:
+    path = existing_files.get(gmail_msg_id)
+    if path is not None and path.exists():
+        return path
+    if path is not None:
+        existing_files.pop(gmail_msg_id, None)
     return None
 
 
@@ -888,6 +924,11 @@ def int_from_state(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def int_from_stats(stats: dict[str, int], key: str, default: int) -> int:
+    value = stats.get(key, default)
+    return value if isinstance(value, int) and value > 0 else default
+
+
 def max_uid_value(uids: list[bytes]) -> int:
     return max(int(uid) for uid in uids)
 
@@ -909,6 +950,36 @@ def restore_existing_labels(replacement: dict[str, Any], previous_entry: dict[st
             merge_label(replacement, label)
 
 
+def format_exception(exc: BaseException) -> str:
+    class_name = exc.__class__.__name__
+    if isinstance(exc, imaplib.IMAP4.abort):
+        class_name = "IMAP abort"
+
+    detail = str(exc).strip()
+    return f"{class_name}: {detail}" if detail else class_name
+
+
+def is_retryable_download_error(error: str | None) -> bool:
+    if not error:
+        return False
+    normalized = error.lower()
+    return any(pattern in normalized for pattern in RETRYABLE_GMAIL_ERROR_PATTERNS) or any(
+        pattern in normalized for pattern in RETRYABLE_NETWORK_ERROR_PATTERNS
+    )
+
+
+def reduced_worker_count(current_count: int) -> int:
+    if current_count > 8:
+        return 8
+    if current_count > 4:
+        return 4
+    if current_count > 2:
+        return 2
+    if current_count > 1:
+        return 1
+    return 1
+
+
 def download_worker(
     credentials: Credentials,
     mailbox: Mailbox,
@@ -922,7 +993,7 @@ def download_worker(
         connection = connect_and_login(credentials)
         select_mailbox(connection, mailbox)
     except Exception as exc:
-        connection_error = str(exc)
+        connection_error = format_exception(exc)
 
     try:
         while True:
@@ -974,7 +1045,7 @@ def download_worker(
                             byte_size=None,
                             sha256=None,
                             downloaded_at=None,
-                            error=str(exc),
+                            error=format_exception(exc),
                         )
                     )
             finally:
@@ -988,11 +1059,12 @@ def download_pending_messages(
     mailbox: Mailbox,
     pending_items: list[PendingDownload],
     status: LiveStatus,
+    worker_count: int,
 ) -> list[DownloadOutcome]:
     if not pending_items:
         return []
 
-    worker_count = min(DEFAULT_DOWNLOAD_WORKERS, len(pending_items))
+    worker_count = max(1, min(worker_count, len(pending_items)))
     task_queue: Queue[PendingDownload | None] = Queue()
     result_queue: Queue[DownloadOutcome] = Queue()
     outcomes: list[DownloadOutcome] = []
@@ -1061,6 +1133,50 @@ def download_progress_message(
     )
 
 
+def download_with_adaptive_workers(
+    credentials: Credentials,
+    mailbox: Mailbox,
+    pending_items: list[PendingDownload],
+    status: LiveStatus,
+    stats: dict[str, int],
+) -> list[DownloadOutcome]:
+    remaining = pending_items
+    completed: list[DownloadOutcome] = []
+
+    while remaining:
+        worker_count = int_from_stats(stats, "download_workers", DEFAULT_DOWNLOAD_WORKERS)
+        outcomes = download_pending_messages(credentials, mailbox, remaining, status, worker_count)
+        retryable = [
+            outcome
+            for outcome in outcomes
+            if outcome.error is not None and is_retryable_download_error(outcome.error)
+        ]
+        final = [
+            outcome
+            for outcome in outcomes
+            if outcome.error is None or not is_retryable_download_error(outcome.error)
+        ]
+        completed.extend(final)
+
+        if not retryable:
+            break
+
+        next_worker_count = reduced_worker_count(worker_count)
+        if next_worker_count == worker_count:
+            completed.extend(retryable)
+            break
+
+        stats["download_workers"] = next_worker_count
+        stats["worker_backoffs"] += 1
+        remaining = [outcome.pending for outcome in retryable]
+        status.line(
+            f"  Gmail throttled or dropped connections; retrying {len(remaining)} messages "
+            f"with {next_worker_count} workers."
+        )
+
+    return completed
+
+
 def mailbox_progress_message(
     mailbox_name: str,
     processed: int,
@@ -1089,6 +1205,7 @@ def sync_mailbox(
     credentials: Credentials,
     mailbox: Mailbox,
     email_root: Path,
+    existing_files: dict[str, Path],
     index: dict[str, Any],
     stats: dict[str, int],
     status: LiveStatus,
@@ -1201,7 +1318,7 @@ def sync_mailbox(
                     stats["skipped"] += 1
                     continue
 
-                existing_by_id = find_existing_message_file(raw_dir, metadata.gmail_msg_id)
+                existing_by_id = find_existing_message_file(existing_files, metadata.gmail_msg_id)
                 if existing_by_id is not None:
                     replacement = index_entry_for_file(
                         metadata,
@@ -1233,7 +1350,7 @@ def sync_mailbox(
                 )
                 continue
             else:
-                existing_by_id = find_existing_message_file(raw_dir, metadata.gmail_msg_id)
+                existing_by_id = find_existing_message_file(existing_files, metadata.gmail_msg_id)
                 if existing_by_id is not None:
                     messages[metadata.gmail_msg_id] = index_entry_for_file(
                         metadata,
@@ -1257,6 +1374,7 @@ def sync_mailbox(
                     mailbox.display_name,
                     downloaded_at=None,
                 )
+                existing_files[metadata.gmail_msg_id] = final_path
                 stats["indexed_existing"] += 1
                 dirty_count += 1
                 continue
@@ -1272,7 +1390,7 @@ def sync_mailbox(
                 )
             )
 
-        for outcome in download_pending_messages(credentials, mailbox, pending_downloads, status):
+        for outcome in download_with_adaptive_workers(credentials, mailbox, pending_downloads, status, stats):
             pending = outcome.pending
             if outcome.error is not None:
                 stats["errors"] += 1
@@ -1299,6 +1417,7 @@ def sync_mailbox(
             )
             restore_existing_labels(entry, pending.previous_entry)
             messages[pending.metadata.gmail_msg_id] = entry
+            existing_files[pending.metadata.gmail_msg_id] = pending.final_path
             stats["downloaded_bytes"] += outcome.byte_size
             if pending.restoring:
                 stats["restored_missing"] += 1
@@ -1366,6 +1485,10 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
     if removed_part_files:
         status.line(f"Removed {removed_part_files} stale partial download files.")
 
+    existing_files = build_existing_file_lookup(email_root / "raw")
+    if existing_files:
+        status.line(f"Indexed {len(existing_files)} existing raw email files.")
+
     index_path = email_root / "_state" / "message_index.json"
     index = load_message_index(index_path)
     mailboxes = list_selectable_mailboxes(connection)
@@ -1383,6 +1506,8 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         "indexed_existing": 0,
         "labels_merged": 0,
         "errors": 0,
+        "download_workers": DEFAULT_DOWNLOAD_WORKERS,
+        "worker_backoffs": 0,
     }
 
     processed_mailboxes: list[str] = []
@@ -1393,6 +1518,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
                 credentials,
                 mailbox,
                 email_root,
+                existing_files,
                 index,
                 stats,
                 status,
@@ -1462,6 +1588,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Restored missing: {summary['restored_missing']}")
         print(f"  Indexed existing: {summary['indexed_existing']}")
         print(f"  Errors: {summary['errors']}")
+        print(f"  Final workers: {summary['download_workers']}")
+        print(f"  Worker backoffs: {summary['worker_backoffs']}")
         print(f"  Partial files cleaned: {summary['removed_part_files']}")
         print(f"  Raw emails: {email_root / 'raw'}")
         return 0 if summary["errors"] == 0 else 1

@@ -18,8 +18,10 @@ Downloads use parallel IMAP workers by default. The worker count is chosen from 
 
 The script also:
 
-- Fetches message metadata in batches.
+- Fetches message metadata in batches of 500 UIDs.
+- Pre-indexes existing `.eml` filenames once at startup instead of scanning the filesystem per message.
 - Downloads missing raw emails in parallel.
+- Automatically backs down worker count when Gmail reports known retryable connection/rate-limit errors.
 - Processes Gmail UIDs from highest to lowest so newer messages are queued first.
 - Computes SHA-256 while writing each `.eml` file.
 - Stores per-mailbox resume markers so later runs skip already-scanned UID ranges.
@@ -27,6 +29,7 @@ The script also:
 - Removes stale `.part` files at startup and on exit.
 
 Google documents a Gmail IMAP download bandwidth limit of 2500 MB per day for Workspace accounts: <https://support.google.com/a/answer/1071518>.
+Gmail Help documents the `"Too many simultaneous connections"` IMAP error and a 15-client connection limit: <https://support.google.com/mail/answer/7126229>.
 
 ## Quick Start
 
