@@ -254,6 +254,10 @@ def format_bytes(byte_count: int) -> str:
     return f"{byte_count} B"
 
 
+def format_int(value: int) -> str:
+    return f"{value:,}"
+
+
 def format_duration(seconds: float | None) -> str:
     if seconds is None or seconds < 0:
         return "--"
@@ -275,6 +279,13 @@ def progress_bar(done: int, total: int, *, width: int = 18) -> str:
     done = max(0, min(done, total))
     filled = round(width * done / total)
     return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def progress_percent(done: int, total: int) -> str:
+    if total <= 0:
+        return "  0%"
+    percent = round(100 * max(0, min(done, total)) / total)
+    return f"{percent:3d}%"
 
 
 def elapsed_since(started_at: float) -> float:
@@ -1472,9 +1483,10 @@ def download_progress_message(
         retry_detail = f" | retry {download_retries} | reconnect {worker_reconnects}"
 
     return (
-        f"{mailbox_name} {progress_bar(completed, total)} downloads {completed}/{total} "
-        f"| {byte_progress} | {message_rate:.1f}/s | {format_bytes(byte_rate)}/s "
-        f"| elapsed {format_duration(elapsed)} | ETA {format_duration(eta)} | {worker_count} workers"
+        f"{mailbox_name} {progress_percent(completed, total)} {progress_bar(completed, total)} "
+        f"| downloads {format_int(completed)}/{format_int(total)} "
+        f"| bytes {byte_progress} | rate {message_rate:.1f}/s, {format_bytes(byte_rate)}/s "
+        f"| time {format_duration(elapsed)} left {format_duration(eta)} | workers {worker_count}"
         f"{retry_detail}"
     )
 
@@ -1541,10 +1553,68 @@ def mailbox_progress_message(
     uid_rate = processed / elapsed
     byte_rate = int(downloaded_bytes / elapsed)
     return (
-        f"{mailbox_name} {progress_bar(processed, total)} UIDs {processed}/{total} "
-        f"| new {downloaded} | {format_bytes(downloaded_bytes)} | {uid_rate:.1f} uid/s "
-        f"| {format_bytes(byte_rate)}/s | elapsed {format_duration(elapsed)} "
-        f"| ETA {format_duration(eta)} | err {errors}"
+        f"{mailbox_name} {progress_percent(processed, total)} {progress_bar(processed, total)} "
+        f"| UIDs {format_int(processed)}/{format_int(total)} | new {format_int(downloaded)} "
+        f"| bytes {format_bytes(downloaded_bytes)} | rate {uid_rate:.1f} uid/s, {format_bytes(byte_rate)}/s "
+        f"| time {format_duration(elapsed)} left {format_duration(eta)} | err {format_int(errors)}"
+    )
+
+
+def print_summary_section(title: str, rows: list[tuple[str, str]]) -> None:
+    print(title)
+    label_width = max((len(label) for label, _value in rows), default=0)
+    for label, value in rows:
+        print(f"  {label.ljust(label_width)}  {value}")
+
+
+def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_seconds: float) -> None:
+    raw_downloaded = summary["downloaded"] + summary["restored_missing"]
+    byte_rate = int(summary["downloaded_bytes"] / max(elapsed_seconds, 0.001))
+    status = "success" if summary["errors"] == 0 else "completed with errors"
+
+    print()
+    print(f"Done in {format_duration(elapsed_seconds)} ({status}).")
+    print()
+    print_summary_section(
+        "Messages",
+        [
+            ("downloaded", format_int(summary["downloaded"])),
+            ("restored missing", format_int(summary["restored_missing"])),
+            ("indexed existing", format_int(summary["indexed_existing"])),
+            ("skipped", format_int(summary["skipped"])),
+            ("total indexed", format_int(summary["total_messages_indexed"])),
+        ],
+    )
+    print()
+    print_summary_section(
+        "Transfer",
+        [
+            ("raw downloaded", format_int(raw_downloaded)),
+            ("downloaded bytes", format_bytes(summary["downloaded_bytes"])),
+            ("average speed", f"{format_bytes(byte_rate)}/s"),
+            ("raw emails", str(email_root / "raw")),
+        ],
+    )
+    print()
+    print_summary_section(
+        "Reliability",
+        [
+            ("errors", format_int(summary["errors"])),
+            ("download retries", format_int(summary["download_retries"])),
+            ("worker reconnects", format_int(summary["worker_reconnects"])),
+            ("partial files cleaned", format_int(summary["removed_part_files"])),
+        ],
+    )
+    print()
+    print_summary_section(
+        "Tuning",
+        [
+            ("final workers", format_int(summary["download_workers"])),
+            ("worker backoffs", format_int(summary["worker_backoffs"])),
+            ("metadata batch", format_int(summary["metadata_batch_size"])),
+            ("metadata backoffs", format_int(summary["metadata_batch_backoffs"])),
+            ("metadata growths", format_int(summary["metadata_batch_growths"])),
+        ],
     )
 
 
@@ -1982,6 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     config_path = args.config.expanduser().resolve()
     email_root = args.emails_dir.expanduser().resolve()
+    started_timestamp = datetime.now().timestamp()
     started_at = iso_now()
     connection: imaplib.IMAP4_SSL | None = None
 
@@ -1989,41 +2060,30 @@ def main(argv: list[str] | None = None) -> int:
         credentials, connection = get_authenticated_connection(config_path)
         summary = download_archive(credentials, connection, email_root)
         completed_at = iso_now()
+        elapsed_seconds = elapsed_since(started_timestamp)
         sync_state = {
             "last_started_at": started_at,
             "last_completed_at": completed_at,
             "last_status": "success" if summary["errors"] == 0 else "completed_with_errors",
+            "elapsed_seconds": round(elapsed_seconds, 3),
             **summary,
         }
         write_sync_state(email_root, sync_state)
 
-        print("\nDone.")
-        print(f"  Downloaded: {summary['downloaded']}")
-        print(f"  Downloaded bytes: {format_bytes(summary['downloaded_bytes'])}")
-        print(f"  Skipped: {summary['skipped']}")
-        print(f"  Restored missing: {summary['restored_missing']}")
-        print(f"  Indexed existing: {summary['indexed_existing']}")
-        print(f"  Errors: {summary['errors']}")
-        print(f"  Final workers: {summary['download_workers']}")
-        print(f"  Worker backoffs: {summary['worker_backoffs']}")
-        print(f"  Download retries: {summary['download_retries']}")
-        print(f"  Worker reconnects: {summary['worker_reconnects']}")
-        print(f"  Final metadata batch size: {summary['metadata_batch_size']}")
-        print(f"  Metadata batch backoffs: {summary['metadata_batch_backoffs']}")
-        print(f"  Metadata batch growths: {summary['metadata_batch_growths']}")
-        print(f"  Partial files cleaned: {summary['removed_part_files']}")
-        print(f"  Raw emails: {email_root / 'raw'}")
+        print_final_summary(summary, email_root, elapsed_seconds)
         return 0 if summary["errors"] == 0 else 1
 
     except KeyboardInterrupt:
         removed_part_files = cleanup_part_files(email_root)
-        print(f"\nInterrupted. Removed {removed_part_files} partial download files.")
+        elapsed_seconds = elapsed_since(started_timestamp)
+        print(f"\nInterrupted after {format_duration(elapsed_seconds)}. Removed {removed_part_files} partial download files.")
         write_sync_state(
             email_root,
             {
                 "last_started_at": started_at,
                 "last_completed_at": iso_now(),
                 "last_status": "interrupted",
+                "elapsed_seconds": round(elapsed_seconds, 3),
                 "removed_part_files": removed_part_files,
             },
         )
@@ -2033,6 +2093,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Credentials were not saved or changed because they could not be tested.")
         return 2
     except RuntimeError as exc:
+        elapsed_seconds = elapsed_since(started_timestamp)
         print(f"Error: {exc}")
         write_sync_state(
             email_root,
@@ -2040,6 +2101,7 @@ def main(argv: list[str] | None = None) -> int:
                 "last_started_at": started_at,
                 "last_completed_at": iso_now(),
                 "last_status": "failed",
+                "elapsed_seconds": round(elapsed_seconds, 3),
                 "error": str(exc),
             },
         )
