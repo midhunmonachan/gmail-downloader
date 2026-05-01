@@ -495,7 +495,11 @@ def search_uids(connection: imaplib.IMAP4_SSL, *, start_uid: int | None = None) 
         raise RuntimeError(f"Could not search selected mailbox: {data!r}")
     if not data or not data[0]:
         return []
-    return data[0].split()
+    return sort_uids_newest_first(data[0].split())
+
+
+def sort_uids_newest_first(uids: list[bytes]) -> list[bytes]:
+    return sorted(uids, key=lambda uid: int(uid), reverse=True)
 
 
 def combined_fetch_response(data: list[Any]) -> bytes:

@@ -20,6 +20,7 @@ The script also:
 
 - Fetches message metadata in batches.
 - Downloads missing raw emails in parallel.
+- Processes Gmail UIDs from highest to lowest so newer messages are queued first.
 - Computes SHA-256 while writing each `.eml` file.
 - Stores per-mailbox resume markers so later runs skip already-scanned UID ranges.
 - Shows live progress while scanning and downloading.
