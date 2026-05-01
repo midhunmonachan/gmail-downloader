@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
 from threading import Thread
-from typing import Any
+from typing import Any, Callable
 
 
 IMAP_HOST = "imap.gmail.com"
@@ -160,6 +160,18 @@ class DownloadOutcome:
     reconnects: int = 0
 
 
+@dataclass(frozen=True)
+class MailboxPlan:
+    mailbox: Mailbox
+    message_count: int
+    uidvalidity: str | None
+    state: dict[str, Any]
+    sync_mode: str
+    start_uid: int | None
+    end_uid: int | None
+    uids: list[bytes]
+
+
 class CredentialError(RuntimeError):
     """Raised when credential validation should be retried."""
 
@@ -171,46 +183,68 @@ class NetworkValidationError(RuntimeError):
 class LiveStatus:
     def __init__(self) -> None:
         self.dynamic = sys.stdout.isatty() and os.environ.get("TERM", "dumb").lower() != "dumb"
-        self.last_message = ""
-        self.last_width = 0
+        self.last_lines: list[str] = []
         self.last_update = 0.0
 
     def update(self, message: str, *, force: bool = False) -> None:
         now = datetime.now().timestamp()
         if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
             return
-        message = self.fit_message(message)
-        self.last_message = message
-        self.last_width = max(len(message), self.last_width)
         self.last_update = now
         if self.dynamic:
-            print("\r" + message.ljust(self.last_width), end="", flush=True)
+            lines = self.fit_lines(message)
+            self.clear_dynamic()
+            print("\n".join(lines), end="", flush=True)
+            self.last_lines = lines
         else:
             print(message, flush=True)
 
     def line(self, message: str = "") -> None:
-        if self.dynamic and self.last_message:
-            print("\r" + " " * self.last_width + "\r", end="", flush=True)
-            self.last_message = ""
-            self.last_width = 0
+        self.clear_dynamic()
         if message:
             print(message, flush=True)
 
     def done(self) -> None:
-        if self.dynamic and self.last_message:
+        if self.dynamic and self.last_lines:
             print()
-            self.last_message = ""
-            self.last_width = 0
+            self.last_lines = []
 
-    def fit_message(self, message: str) -> str:
+    def clear_dynamic(self) -> None:
+        if not self.dynamic or not self.last_lines:
+            return
+
+        print("\r\x1b[2K", end="")
+        for _ in range(len(self.last_lines) - 1):
+            print("\x1b[1A\r\x1b[2K", end="")
+        self.last_lines = []
+
+    def fit_lines(self, message: str) -> list[str]:
         if not self.dynamic:
-            return message
+            return [message]
 
         columns = shutil.get_terminal_size((120, 20)).columns
         limit = max(40, columns - 1)
         if len(message) <= limit:
-            return message
-        return message[: limit - 4].rstrip() + " ..."
+            return [message]
+
+        parts = message.split(" | ")
+        first_line = parts[0]
+        second_parts: list[str] = []
+        for part in parts[1:]:
+            candidate = first_line + " | " + part
+            if not second_parts and len(candidate) <= limit:
+                first_line = candidate
+            else:
+                second_parts.append(part)
+
+        if len(first_line) > limit:
+            first_line = first_line[: limit - 4].rstrip() + " ..."
+
+        second_line = "  " + " | ".join(second_parts) if second_parts else ""
+        if second_line and len(second_line) > limit:
+            second_line = second_line[: limit - 4].rstrip() + " ..."
+
+        return [first_line, second_line] if second_line else [first_line]
 
 
 class CompactHelpParser(argparse.ArgumentParser):
@@ -1382,8 +1416,8 @@ def download_pending_messages(
     credentials: Credentials,
     mailbox: Mailbox,
     pending_items: list[PendingDownload],
-    status: LiveStatus,
     worker_count: int,
+    progress_callback: Callable[[int, int, int, int, int, int, int], None] | None = None,
 ) -> list[DownloadOutcome]:
     if not pending_items:
         return []
@@ -1397,7 +1431,6 @@ def download_pending_messages(
     downloaded_bytes = 0
     download_retries = 0
     worker_reconnects = 0
-    started_at = datetime.now().timestamp()
 
     threads = [
         Thread(
@@ -1415,20 +1448,8 @@ def download_pending_messages(
     for _ in threads:
         task_queue.put(None)
 
-    status.update(
-        download_progress_message(
-            mailbox.display_name,
-            0,
-            len(pending_items),
-            0,
-            expected_bytes,
-            download_retries,
-            worker_reconnects,
-            started_at,
-            worker_count,
-        ),
-        force=True,
-    )
+    if progress_callback is not None:
+        progress_callback(0, len(pending_items), 0, expected_bytes, download_retries, worker_reconnects, worker_count)
 
     while len(outcomes) < len(pending_items):
         outcome = result_queue.get()
@@ -1438,20 +1459,16 @@ def download_pending_messages(
         download_retries += outcome.retries
         worker_reconnects += outcome.reconnects
         completed = len(outcomes)
-        status.update(
-            download_progress_message(
-                mailbox.display_name,
+        if progress_callback is not None:
+            progress_callback(
                 completed,
                 len(pending_items),
                 downloaded_bytes,
                 expected_bytes,
                 download_retries,
                 worker_reconnects,
-                started_at,
                 worker_count,
-            ),
-            force=completed == len(pending_items),
-        )
+            )
 
     task_queue.join()
     for thread in threads:
@@ -1460,50 +1477,47 @@ def download_pending_messages(
     return outcomes
 
 
-def download_progress_message(
-    mailbox_name: str,
-    completed: int,
-    total: int,
-    downloaded_bytes: int,
-    expected_bytes: int,
-    download_retries: int,
-    worker_reconnects: int,
-    started_at: float,
-    worker_count: int,
-) -> str:
-    elapsed = elapsed_since(started_at)
-    eta = estimate_remaining(completed, total, elapsed)
-    message_rate = completed / elapsed
-    byte_rate = int(downloaded_bytes / elapsed)
-    byte_progress = format_bytes(downloaded_bytes)
-    if expected_bytes > 0:
-        byte_progress += f"/{format_bytes(expected_bytes)}"
-    retry_detail = ""
-    if download_retries or worker_reconnects:
-        retry_detail = f" | retry {download_retries} | reconnect {worker_reconnects}"
-
-    return (
-        f"{mailbox_name} {progress_percent(completed, total)} {progress_bar(completed, total)} "
-        f"| downloads {format_int(completed)}/{format_int(total)} "
-        f"| bytes {byte_progress} | rate {message_rate:.1f}/s, {format_bytes(byte_rate)}/s "
-        f"| time {format_duration(elapsed)} left {format_duration(eta)} | workers {worker_count}"
-        f"{retry_detail}"
-    )
-
-
 def download_with_adaptive_workers(
     credentials: Credentials,
     mailbox: Mailbox,
     pending_items: list[PendingDownload],
     status: LiveStatus,
     stats: dict[str, int],
+    progress_callback: Callable[[str], None] | None = None,
 ) -> list[DownloadOutcome]:
     remaining = pending_items
     completed: list[DownloadOutcome] = []
 
     while remaining:
         worker_count = int_from_stats(stats, "download_workers", DEFAULT_DOWNLOAD_WORKERS)
-        outcomes = download_pending_messages(credentials, mailbox, remaining, status, worker_count)
+        def on_download_progress(
+            completed: int,
+            total: int,
+            downloaded_bytes: int,
+            expected_bytes: int,
+            download_retries: int,
+            worker_reconnects: int,
+            _active_worker_count: int,
+        ) -> None:
+            if progress_callback is not None:
+                progress_callback(
+                    download_activity(
+                        completed,
+                        total,
+                        downloaded_bytes,
+                        expected_bytes,
+                        download_retries,
+                        worker_reconnects,
+                    )
+                )
+
+        outcomes = download_pending_messages(
+            credentials,
+            mailbox,
+            remaining,
+            worker_count,
+            progress_callback=on_download_progress,
+        )
         stats["download_retries"] += sum(outcome.retries for outcome in outcomes)
         stats["worker_reconnects"] += sum(outcome.reconnects for outcome in outcomes)
         retryable = [
@@ -1530,34 +1544,54 @@ def download_with_adaptive_workers(
         stats["worker_backoffs"] += 1
         remaining = [outcome.pending for outcome in retryable]
         status.line(
-            f"  Gmail throttled or dropped connections; retrying {len(remaining)} messages "
+            f"Gmail throttled or dropped connections; retrying {len(remaining)} messages "
             f"with {next_worker_count} workers."
         )
 
     return completed
 
 
-def mailbox_progress_message(
-    mailbox_name: str,
-    processed: int,
-    total: int,
-    started_at: float,
-    stats: dict[str, int],
-    baseline: dict[str, int],
-) -> str:
+def mark_work_done(stats: dict[str, int], count: int = 1) -> None:
+    if count <= 0:
+        return
+    total = stats.get("work_total", 0)
+    next_value = stats.get("work_done", 0) + count
+    stats["work_done"] = min(next_value, total) if total > 0 else next_value
+
+
+def total_progress_message(stats: dict[str, int], started_at: float, activity: str = "") -> str:
+    done = stats.get("work_done", 0)
+    total = stats.get("work_total", 0)
     elapsed = elapsed_since(started_at)
-    eta = estimate_remaining(processed, total, elapsed)
-    downloaded = stats["downloaded"] + stats["restored_missing"] - baseline["downloaded_total"]
-    downloaded_bytes = stats["downloaded_bytes"] - baseline["downloaded_bytes"]
-    errors = stats["errors"] - baseline["errors"]
-    uid_rate = processed / elapsed
-    byte_rate = int(downloaded_bytes / elapsed)
+    eta = estimate_remaining(done, total, elapsed)
+    byte_rate = int(stats["downloaded_bytes"] / elapsed)
+    downloaded = stats["downloaded"] + stats["restored_missing"]
+    activity_detail = f" | {activity}" if activity else ""
+    retry_detail = f" | {format_int(stats['download_retries'])} retries" if stats["download_retries"] else ""
+
     return (
-        f"{mailbox_name} {progress_percent(processed, total)} {progress_bar(processed, total)} "
-        f"| UIDs {format_int(processed)}/{format_int(total)} | new {format_int(downloaded)} "
-        f"| bytes {format_bytes(downloaded_bytes)} | rate {uid_rate:.1f} uid/s, {format_bytes(byte_rate)}/s "
-        f"| time {format_duration(elapsed)} left {format_duration(eta)} | err {format_int(errors)}"
+        f"Total {progress_percent(done, total)} {progress_bar(done, total)} "
+        f"| {format_int(done)} of {format_int(total)} archived "
+        f"| {format_int(downloaded)} new "
+        f"| {format_bytes(stats['downloaded_bytes'])} at {format_bytes(byte_rate)}/s "
+        f"| {format_duration(elapsed)} elapsed | about {format_duration(eta)} left"
+        f"{activity_detail}{retry_detail}"
     )
+
+
+def download_activity(
+    completed: int,
+    total: int,
+    downloaded_bytes: int,
+    expected_bytes: int,
+    _download_retries: int,
+    _worker_reconnects: int,
+) -> str:
+    byte_progress = format_bytes(downloaded_bytes)
+    if expected_bytes > 0:
+        byte_progress += f"/{format_bytes(expected_bytes)}"
+
+    return f"downloading {format_int(completed)} of {format_int(total)} | batch {byte_progress}"
 
 
 def print_summary_section(title: str, rows: list[tuple[str, str]]) -> None:
@@ -1578,6 +1612,8 @@ def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_secon
     print_summary_section(
         "Messages",
         [
+            ("archived coverage", f"{format_int(summary['work_done'])}/{format_int(summary['work_total'])}"),
+            ("account messages", format_int(summary["account_message_total"])),
             ("downloaded", format_int(summary["downloaded"])),
             ("restored missing", format_int(summary["restored_missing"])),
             ("indexed existing", format_int(summary["indexed_existing"])),
@@ -1602,8 +1638,12 @@ def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_secon
             ("errors", format_int(summary["errors"])),
             ("download retries", format_int(summary["download_retries"])),
             ("worker reconnects", format_int(summary["worker_reconnects"])),
-            ("partial files cleaned", format_int(summary["removed_part_files"])),
-        ],
+        ]
+        + (
+            [("partial files cleaned", format_int(summary["removed_part_files"]))]
+            if summary["removed_part_files"]
+            else []
+        ),
     )
     print()
     print_summary_section(
@@ -1618,19 +1658,13 @@ def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_secon
     )
 
 
-def sync_mailbox(
+def build_mailbox_plan(
     connection: imaplib.IMAP4_SSL,
-    credentials: Credentials,
     mailbox: Mailbox,
-    email_root: Path,
-    existing_files: dict[str, Path],
     state_store: StateStore,
-    stats: dict[str, int],
-    status: LiveStatus,
     *,
     force_full_scan: bool,
-) -> None:
-    raw_dir = email_root / "raw"
+) -> MailboxPlan:
     message_count, uidvalidity = select_mailbox(connection, mailbox)
     state = state_store.get_mailbox_state(mailbox.display_name)
     last_seen_uid = int_from_state(state.get("last_seen_uid"))
@@ -1645,15 +1679,44 @@ def sync_mailbox(
     if not force_full_scan and same_uidvalidity and backfill_complete and last_seen_uid is not None:
         sync_mode = "incremental"
         start_uid = last_seen_uid + 1
-        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, checking newer than UID {last_seen_uid})")
     elif not force_full_scan and same_uidvalidity and not backfill_complete and backfill_before_uid is not None:
         sync_mode = "backfill"
         end_uid = backfill_before_uid - 1
-        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, continuing backfill before UID {backfill_before_uid})")
-    else:
-        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, full newest-first scan)")
 
-    uids = search_uids(connection, start_uid=start_uid, end_uid=end_uid)
+    return MailboxPlan(
+        mailbox=mailbox,
+        message_count=message_count,
+        uidvalidity=uidvalidity,
+        state=state,
+        sync_mode=sync_mode,
+        start_uid=start_uid,
+        end_uid=end_uid,
+        uids=search_uids(connection, start_uid=start_uid, end_uid=end_uid),
+    )
+
+
+def sync_mailbox(
+    connection: imaplib.IMAP4_SSL,
+    credentials: Credentials,
+    plan: MailboxPlan,
+    email_root: Path,
+    existing_files: dict[str, Path],
+    state_store: StateStore,
+    stats: dict[str, int],
+    status: LiveStatus,
+    operation_started_at: float,
+) -> None:
+    mailbox = plan.mailbox
+    raw_dir = email_root / "raw"
+    _message_count, current_uidvalidity = select_mailbox(connection, mailbox)
+    if plan.uidvalidity is not None and current_uidvalidity is not None and plan.uidvalidity != current_uidvalidity:
+        raise RuntimeError(f"UIDVALIDITY changed for {mailbox.display_name}; rerun the downloader.")
+
+    uidvalidity = current_uidvalidity or plan.uidvalidity
+    state = dict(plan.state)
+    last_seen_uid = int_from_state(state.get("last_seen_uid"))
+    sync_mode = plan.sync_mode
+    uids = plan.uids
     dirty_count = 0
 
     if not uids:
@@ -1671,7 +1734,6 @@ def sync_mailbox(
             updates["scan_highest_uid"] = None
         state_store.update_mailbox_state(mailbox.display_name, **updates)
         state_store.commit()
-        status.line(f"  No new messages in {mailbox.display_name}")
         return
 
     if sync_mode == "full":
@@ -1679,13 +1741,7 @@ def sync_mailbox(
         state["scan_highest_uid"] = max_uid_value(uids)
         state["backfill_before_uid"] = None
 
-    mailbox_started_at = datetime.now().timestamp()
-    baseline = {
-        "downloaded_total": stats["downloaded"] + stats["restored_missing"],
-        "downloaded_bytes": stats["downloaded_bytes"],
-        "errors": stats["errors"],
-    }
-    status.update(mailbox_progress_message(mailbox.display_name, 0, len(uids), mailbox_started_at, stats, baseline), force=True)
+    status.update(total_progress_message(stats, operation_started_at, "checking metadata"), force=True)
 
     offset = 0
     while offset < len(uids):
@@ -1697,18 +1753,10 @@ def sync_mailbox(
         batch_failed = False
         metadata_fallback = False
         pending_downloads: list[PendingDownload] = []
-        processed_before_batch = offset
+        newly_archived_without_download = 0
 
         status.update(
-            mailbox_progress_message(
-                mailbox.display_name,
-                processed_before_batch,
-                len(uids),
-                mailbox_started_at,
-                stats,
-                baseline,
-            )
-            + f" | metadata {len(uid_batch)}",
+            total_progress_message(stats, operation_started_at, f"checking metadata {format_int(len(uid_batch))}"),
             force=True,
         )
 
@@ -1805,6 +1853,7 @@ def sync_mailbox(
                     existing_files[metadata.gmail_msg_id] = existing_by_id
                     stats["indexed_existing"] += 1
                     dirty_count += 1
+                    newly_archived_without_download += 1
                     continue
 
             filename = filename_for_message(metadata)
@@ -1823,6 +1872,7 @@ def sync_mailbox(
                 existing_files[metadata.gmail_msg_id] = final_path
                 stats["indexed_existing"] += 1
                 dirty_count += 1
+                newly_archived_without_download += 1
                 continue
 
             pending_downloads.append(
@@ -1836,7 +1886,21 @@ def sync_mailbox(
                 )
             )
 
-        for outcome in download_with_adaptive_workers(credentials, mailbox, pending_downloads, status, stats):
+        if newly_archived_without_download:
+            mark_work_done(stats, newly_archived_without_download)
+            status.update(total_progress_message(stats, operation_started_at, "checking metadata"), force=False)
+
+        def on_download_progress(activity: str) -> None:
+            status.update(total_progress_message(stats, operation_started_at, activity), force=False)
+
+        for outcome in download_with_adaptive_workers(
+            credentials,
+            mailbox,
+            pending_downloads,
+            status,
+            stats,
+            progress_callback=on_download_progress,
+        ):
             pending = outcome.pending
             if outcome.error is not None:
                 stats["errors"] += 1
@@ -1870,7 +1934,10 @@ def sync_mailbox(
                 stats["restored_missing"] += 1
             else:
                 stats["downloaded"] += 1
+                mark_work_done(stats)
             dirty_count += 1
+
+        status.update(total_progress_message(stats, operation_started_at), force=True)
 
         if batch_failed:
             state_store.commit()
@@ -1904,17 +1971,7 @@ def sync_mailbox(
                     stats["metadata_batch_growths"] += 1
                 stats["metadata_batch_successes"] = 0
 
-        status.update(
-            mailbox_progress_message(
-                mailbox.display_name,
-                offset,
-                len(uids),
-                mailbox_started_at,
-                stats,
-                baseline,
-            ),
-            force=True,
-        )
+        status.update(total_progress_message(stats, operation_started_at), force=True)
 
         if dirty_count >= DB_COMMIT_EVERY:
             state_store.commit()
@@ -1948,7 +2005,6 @@ def sync_mailbox(
             final_updates["uidvalidity"] = uidvalidity
         state_store.update_mailbox_state(mailbox.display_name, **final_updates)
         state_store.commit()
-    status.line(f"  Completed {mailbox.display_name}: {len(uids)} UIDs checked")
 
 
 def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, email_root: Path) -> dict[str, Any]:
@@ -1958,22 +2014,11 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
     status = LiveStatus()
 
     removed_part_files = cleanup_part_files(email_root)
-    if removed_part_files:
-        status.line(f"Removed {removed_part_files} stale partial download files.")
-
     existing_files = build_existing_file_lookup(email_root / "raw")
-    if existing_files:
-        status.line(f"Indexed {len(existing_files)} existing raw email files.")
 
     state_store = StateStore(email_root)
     try:
-        mailboxes = list_selectable_mailboxes(connection)
-        if not mailboxes:
-            raise RuntimeError("No selectable Gmail mailboxes were found.")
-        force_full_scan = state_store.has_missing_files()
-        if force_full_scan:
-            status.line("Missing indexed .eml files found; using full scans so missing messages can be restored.")
-
+        operation_started_at = datetime.now().timestamp()
         stats = {
             "downloaded": 0,
             "downloaded_bytes": 0,
@@ -1990,27 +2035,61 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             "metadata_batch_backoffs": 0,
             "metadata_batch_growths": 0,
             "metadata_batch_successes": 0,
+            "work_done": 0,
+            "work_total": 0,
+            "account_message_total": 0,
         }
 
-        processed_mailboxes: list[str] = []
+        mailboxes = list_selectable_mailboxes(connection)
+        if not mailboxes:
+            raise RuntimeError("No selectable Gmail mailboxes were found.")
+        force_full_scan = state_store.has_missing_files()
+        indexed_message_count = state_store.count_messages()
+
+        plans: list[MailboxPlan] = []
+        status.update("Preparing mailbox scan ...", force=True)
         for mailbox in mailboxes:
+            try:
+                plan = build_mailbox_plan(
+                    connection,
+                    mailbox,
+                    state_store,
+                    force_full_scan=force_full_scan,
+                )
+                plans.append(plan)
+                stats["account_message_total"] = max(stats["account_message_total"], plan.message_count)
+                stats["work_total"] = stats["account_message_total"]
+                stats["work_done"] = min(indexed_message_count, stats["work_total"])
+                status.update(
+                    total_progress_message(stats, operation_started_at, "preparing scan"),
+                    force=False,
+                )
+            except Exception as exc:
+                status.line()
+                stats["errors"] += 1
+                print(f"Mailbox planning error: {exc}")
+
+        status.update(total_progress_message(stats, operation_started_at), force=True)
+
+        processed_mailboxes: list[str] = []
+        for plan in plans:
             try:
                 sync_mailbox(
                     connection,
                     credentials,
-                    mailbox,
+                    plan,
                     email_root,
                     existing_files,
                     state_store,
                     stats,
                     status,
-                    force_full_scan=force_full_scan,
+                    operation_started_at,
                 )
-                processed_mailboxes.append(mailbox.display_name)
+                processed_mailboxes.append(plan.mailbox.display_name)
             except Exception as exc:
                 status.line()
                 stats["errors"] += 1
-                print(f"Mailbox error for {mailbox.display_name}: {exc}")
+                print(f"Mailbox error: {exc}")
 
         status.done()
         state_store.commit()
@@ -2076,7 +2155,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         removed_part_files = cleanup_part_files(email_root)
         elapsed_seconds = elapsed_since(started_timestamp)
-        print(f"\nInterrupted after {format_duration(elapsed_seconds)}. Removed {removed_part_files} partial download files.")
+        if removed_part_files:
+            print(
+                f"\nInterrupted after {format_duration(elapsed_seconds)}. "
+                f"Removed {removed_part_files} partial download files."
+            )
+        else:
+            print(f"\nInterrupted after {format_duration(elapsed_seconds)}.")
         write_sync_state(
             email_root,
             {
