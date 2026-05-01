@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import getpass
 import hashlib
 import imaplib
@@ -190,7 +191,9 @@ class LiveStatus:
         self.animation_frame = 0
         self.animation_generation = 0
         self.animation_thread: Thread | None = None
+        self.cursor_hidden = False
         self.lock = RLock()
+        atexit.register(self.restore_cursor)
 
     def update(self, message: str, *, force: bool = False) -> None:
         now = datetime.now().timestamp()
@@ -213,6 +216,7 @@ class LiveStatus:
         with self.lock:
             self.animation_generation += 1
             self.clear_dynamic_locked()
+            self.show_cursor_locked()
         if message:
             print(message, flush=True)
 
@@ -222,6 +226,21 @@ class LiveStatus:
             if self.dynamic and self.last_lines:
                 print()
                 self.last_lines = []
+            self.show_cursor_locked()
+
+    def restore_cursor(self) -> None:
+        with self.lock:
+            self.show_cursor_locked()
+
+    def hide_cursor_locked(self) -> None:
+        if self.dynamic and not self.cursor_hidden:
+            print("\x1b[?25l", end="", flush=True)
+            self.cursor_hidden = True
+
+    def show_cursor_locked(self) -> None:
+        if self.dynamic and self.cursor_hidden:
+            print("\x1b[?25h", end="", flush=True)
+            self.cursor_hidden = False
 
     def clear_dynamic(self) -> None:
         with self.lock:
@@ -238,6 +257,7 @@ class LiveStatus:
 
     def render_dynamic_locked(self, message: str) -> None:
         lines = self.fit_lines(message)
+        self.hide_cursor_locked()
         self.clear_dynamic_locked()
         print("\n".join(lines), end="", flush=True)
         self.last_lines = lines
@@ -2140,6 +2160,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         summary.pop("metadata_batch_successes", None)
         return summary
     finally:
+        status.done()
         state_store.close()
 
 
