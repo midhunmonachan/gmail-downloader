@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,7 +26,13 @@ IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT_SECONDS = 30
 APP_NAME = "gmail-downloader"
-METADATA_BATCH_SIZE = 500
+MESSAGE_INDEX_DB_FILENAME = "message_index.sqlite3"
+DEFAULT_METADATA_BATCH_SIZE = 1000
+MAX_METADATA_BATCH_SIZE = 1000
+MIN_METADATA_BATCH_SIZE = 100
+METADATA_BATCH_GROW_AFTER = 8
+DB_COMMIT_EVERY = 1000
+SQLITE_QUERY_CHUNK_SIZE = 900
 GMAIL_IMAP_CONNECTION_LIMIT = 15
 RESERVED_IMAP_CONNECTIONS = 2
 MAIN_IMAP_CONNECTIONS = 1
@@ -210,6 +217,7 @@ class CompactHelpParser(argparse.ArgumentParser):
                 "  --emails-dir DIR            archive output directory",
                 "  --output-dir DIR            alias for --emails-dir",
                 f"  parallel downloads:        {DEFAULT_DOWNLOAD_WORKERS}",
+                f"  metadata batch size:       {DEFAULT_METADATA_BATCH_SIZE}",
                 "Defaults:",
                 f"  config:     {DEFAULT_CONFIG_PATH}",
                 f"  output dir: {DEFAULT_EMAIL_ROOT}",
@@ -651,10 +659,6 @@ def uid_sequence_set(uids: list[bytes]) -> bytes:
     return b",".join(uids)
 
 
-def batched(items: list[bytes], size: int) -> list[list[bytes]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
-
-
 def fetch_metadata_batch(connection: imaplib.IMAP4_SSL, uids: list[bytes]) -> dict[bytes, MessageMetadata]:
     if not uids:
         return {}
@@ -832,29 +836,254 @@ def write_raw_message(path: Path, content: bytes) -> tuple[int, str]:
     return len(content), digest.hexdigest()
 
 
-def empty_message_index() -> dict[str, Any]:
-    return {
-        "version": 1,
-        "updated_at": iso_now(),
-        "messages": {},
-        "mailboxes": {},
-    }
+class StateStore:
+    def __init__(self, email_root: Path) -> None:
+        self.email_root = email_root
+        self.path = email_root / "_state" / MESSAGE_INDEX_DB_FILENAME
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.row_factory = sqlite3.Row
+        self.configure()
+        self.initialize_schema()
 
+    def configure(self) -> None:
+        for statement in (
+            "PRAGMA foreign_keys = ON",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA synchronous = NORMAL",
+            "PRAGMA temp_store = MEMORY",
+            "PRAGMA busy_timeout = 5000",
+        ):
+            self.connection.execute(statement)
 
-def load_message_index(path: Path) -> dict[str, Any]:
-    index = load_json(path, empty_message_index(), strict=True)
-    if not isinstance(index, dict):
-        raise RuntimeError(f"{path} must contain a JSON object.")
-    if not isinstance(index.get("messages"), dict):
-        index["messages"] = {}
-    if "version" not in index:
-        index["version"] = 1
-    return index
+    def initialize_schema(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
+            CREATE TABLE IF NOT EXISTS messages (
+                gmail_msg_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                path TEXT NOT NULL,
+                internal_date TEXT NOT NULL,
+                byte_size INTEGER,
+                sha256 TEXT,
+                gmail_rfc822_size INTEGER,
+                downloaded_at TEXT,
+                last_seen_at TEXT NOT NULL
+            );
 
-def save_message_index(path: Path, index: dict[str, Any]) -> None:
-    index["updated_at"] = iso_now()
-    write_json_atomic(path, index)
+            CREATE INDEX IF NOT EXISTS idx_messages_path
+                ON messages(path);
+
+            CREATE TABLE IF NOT EXISTS message_labels (
+                gmail_msg_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                PRIMARY KEY (gmail_msg_id, label),
+                FOREIGN KEY (gmail_msg_id) REFERENCES messages(gmail_msg_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_labels_label
+                ON message_labels(label);
+
+            CREATE TABLE IF NOT EXISTS mailboxes (
+                mailbox_name TEXT PRIMARY KEY,
+                uidvalidity TEXT,
+                last_seen_uid INTEGER,
+                backfill_before_uid INTEGER,
+                backfill_complete INTEGER NOT NULL DEFAULT 0,
+                scan_highest_uid INTEGER,
+                last_completed_at TEXT
+            );
+            """
+        )
+        self.connection.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            ("schema_version", "2"),
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def entry_from_row(self, row: sqlite3.Row, labels: list[str]) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "gmail_msg_id": row["gmail_msg_id"],
+            "filename": row["filename"],
+            "path": row["path"],
+            "internal_date": row["internal_date"],
+            "labels": sorted(labels),
+            "last_seen_at": row["last_seen_at"],
+        }
+
+        for db_key, entry_key in (
+            ("byte_size", "byte_size"),
+            ("sha256", "sha256"),
+            ("gmail_rfc822_size", "gmail_rfc822_size"),
+            ("downloaded_at", "downloaded_at"),
+        ):
+            value = row[db_key]
+            if value is not None:
+                entry[entry_key] = value
+
+        return entry
+
+    def get_messages(self, gmail_msg_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = sorted({gmail_msg_id for gmail_msg_id in gmail_msg_ids if gmail_msg_id})
+        if not ids:
+            return {}
+
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        labels_by_id: dict[str, list[str]] = {gmail_msg_id: [] for gmail_msg_id in ids}
+
+        for offset in range(0, len(ids), SQLITE_QUERY_CHUNK_SIZE):
+            chunk = ids[offset : offset + SQLITE_QUERY_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self.connection.execute(
+                f"SELECT * FROM messages WHERE gmail_msg_id IN ({placeholders})",
+                chunk,
+            ):
+                rows_by_id[row["gmail_msg_id"]] = row
+
+            for row in self.connection.execute(
+                f"""
+                SELECT gmail_msg_id, label
+                FROM message_labels
+                WHERE gmail_msg_id IN ({placeholders})
+                ORDER BY label
+                """,
+                chunk,
+            ):
+                labels_by_id.setdefault(row["gmail_msg_id"], []).append(row["label"])
+
+        return {
+            gmail_msg_id: self.entry_from_row(row, labels_by_id.get(gmail_msg_id, []))
+            for gmail_msg_id, row in rows_by_id.items()
+        }
+
+    def upsert_message(self, entry: dict[str, Any]) -> None:
+        gmail_msg_id = str(entry["gmail_msg_id"])
+        labels = sorted({label for label in entry.get("labels", []) if isinstance(label, str)})
+        self.connection.execute(
+            """
+            INSERT INTO messages (
+                gmail_msg_id,
+                filename,
+                path,
+                internal_date,
+                byte_size,
+                sha256,
+                gmail_rfc822_size,
+                downloaded_at,
+                last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(gmail_msg_id) DO UPDATE SET
+                filename = excluded.filename,
+                path = excluded.path,
+                internal_date = excluded.internal_date,
+                byte_size = excluded.byte_size,
+                sha256 = excluded.sha256,
+                gmail_rfc822_size = excluded.gmail_rfc822_size,
+                downloaded_at = COALESCE(excluded.downloaded_at, messages.downloaded_at),
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                gmail_msg_id,
+                str(entry["filename"]),
+                str(entry["path"]),
+                str(entry["internal_date"]),
+                entry.get("byte_size"),
+                entry.get("sha256"),
+                entry.get("gmail_rfc822_size"),
+                entry.get("downloaded_at"),
+                entry.get("last_seen_at") or iso_now(),
+            ),
+        )
+
+        self.connection.executemany(
+            "INSERT OR IGNORE INTO message_labels(gmail_msg_id, label) VALUES (?, ?)",
+            ((gmail_msg_id, label) for label in labels),
+        )
+
+    def mark_seen(self, gmail_msg_id: str, label: str) -> bool:
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO message_labels(gmail_msg_id, label) VALUES (?, ?)",
+            (gmail_msg_id, label),
+        )
+        self.connection.execute(
+            "UPDATE messages SET last_seen_at = ? WHERE gmail_msg_id = ?",
+            (iso_now(), gmail_msg_id),
+        )
+        return cursor.rowcount > 0
+
+    def get_mailbox_state(self, mailbox_name: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM mailboxes WHERE mailbox_name = ?",
+            (mailbox_name,),
+        ).fetchone()
+        if row is None:
+            return {}
+
+        return {
+            "uidvalidity": row["uidvalidity"],
+            "last_seen_uid": row["last_seen_uid"],
+            "backfill_before_uid": row["backfill_before_uid"],
+            "backfill_complete": bool(row["backfill_complete"]),
+            "scan_highest_uid": row["scan_highest_uid"],
+            "last_completed_at": row["last_completed_at"],
+        }
+
+    def update_mailbox_state(self, mailbox_name: str, **updates: Any) -> None:
+        state = self.get_mailbox_state(mailbox_name)
+        state.update(updates)
+        self.connection.execute(
+            """
+            INSERT INTO mailboxes (
+                mailbox_name,
+                uidvalidity,
+                last_seen_uid,
+                backfill_before_uid,
+                backfill_complete,
+                scan_highest_uid,
+                last_completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mailbox_name) DO UPDATE SET
+                uidvalidity = excluded.uidvalidity,
+                last_seen_uid = excluded.last_seen_uid,
+                backfill_before_uid = excluded.backfill_before_uid,
+                backfill_complete = excluded.backfill_complete,
+                scan_highest_uid = excluded.scan_highest_uid,
+                last_completed_at = excluded.last_completed_at
+            """,
+            (
+                mailbox_name,
+                state.get("uidvalidity"),
+                int_from_state(state.get("last_seen_uid")),
+                int_from_state(state.get("backfill_before_uid")),
+                1 if state.get("backfill_complete") else 0,
+                int_from_state(state.get("scan_highest_uid")),
+                state.get("last_completed_at"),
+            ),
+        )
+
+    def has_missing_files(self) -> bool:
+        for row in self.connection.execute("SELECT path, filename FROM messages"):
+            entry = {"path": row["path"], "filename": row["filename"]}
+            if message_file_exists(self.email_root, entry) is None:
+                return True
+        return False
+
+    def count_messages(self) -> int:
+        row = self.connection.execute("SELECT COUNT(*) AS count FROM messages").fetchone()
+        return int(row["count"]) if row is not None else 0
 
 
 def write_sync_state(email_root: Path, summary: dict[str, Any]) -> None:
@@ -886,34 +1115,6 @@ def select_mailbox(connection: imaplib.IMAP4_SSL, mailbox: Mailbox) -> tuple[int
         except (TypeError, ValueError):
             return 0, uidvalidity
     return 0, uidvalidity
-
-
-def indexed_file_missing(email_root: Path, index: dict[str, Any]) -> bool:
-    messages = index.get("messages")
-    if not isinstance(messages, dict):
-        return False
-
-    for entry in messages.values():
-        if isinstance(entry, dict) and message_file_exists(email_root, entry) is None:
-            return True
-    return False
-
-
-def mailbox_states(index: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    states = index.setdefault("mailboxes", {})
-    if not isinstance(states, dict):
-        states = {}
-        index["mailboxes"] = states
-    return states
-
-
-def mailbox_state(index: dict[str, Any], mailbox_name: str) -> dict[str, Any]:
-    states = mailbox_states(index)
-    state = states.setdefault(mailbox_name, {})
-    if not isinstance(state, dict):
-        state = {}
-        states[mailbox_name] = state
-    return state
 
 
 def int_from_state(value: Any) -> int | None:
@@ -978,6 +1179,38 @@ def reduced_worker_count(current_count: int) -> int:
     if current_count > 1:
         return 1
     return 1
+
+
+def clamp_metadata_batch_size(batch_size: int) -> int:
+    return max(MIN_METADATA_BATCH_SIZE, min(MAX_METADATA_BATCH_SIZE, batch_size))
+
+
+def reduced_metadata_batch_size(current_size: int) -> int:
+    if current_size > 500:
+        return 500
+    if current_size > 250:
+        return 250
+    if current_size > MIN_METADATA_BATCH_SIZE:
+        return MIN_METADATA_BATCH_SIZE
+    return MIN_METADATA_BATCH_SIZE
+
+
+def increased_metadata_batch_size(current_size: int) -> int:
+    if current_size < 250:
+        return 250
+    if current_size < 500:
+        return 500
+    if current_size < MAX_METADATA_BATCH_SIZE:
+        return MAX_METADATA_BATCH_SIZE
+    return MAX_METADATA_BATCH_SIZE
+
+
+def sorted_pending_downloads(pending_items: list[PendingDownload]) -> list[PendingDownload]:
+    return sorted(
+        pending_items,
+        key=lambda item: (item.metadata.rfc822_size or 0, int(item.uid)),
+        reverse=True,
+    )
 
 
 def download_worker(
@@ -1065,6 +1298,8 @@ def download_pending_messages(
         return []
 
     worker_count = max(1, min(worker_count, len(pending_items)))
+    pending_items = sorted_pending_downloads(pending_items)
+    expected_bytes = sum(item.metadata.rfc822_size or 0 for item in pending_items)
     task_queue: Queue[PendingDownload | None] = Queue()
     result_queue: Queue[DownloadOutcome] = Queue()
     outcomes: list[DownloadOutcome] = []
@@ -1087,7 +1322,18 @@ def download_pending_messages(
     for _ in threads:
         task_queue.put(None)
 
-    status.update(download_progress_message(mailbox.display_name, 0, len(pending_items), 0, started_at, worker_count), force=True)
+    status.update(
+        download_progress_message(
+            mailbox.display_name,
+            0,
+            len(pending_items),
+            0,
+            expected_bytes,
+            started_at,
+            worker_count,
+        ),
+        force=True,
+    )
 
     while len(outcomes) < len(pending_items):
         outcome = result_queue.get()
@@ -1101,6 +1347,7 @@ def download_pending_messages(
                 completed,
                 len(pending_items),
                 downloaded_bytes,
+                expected_bytes,
                 started_at,
                 worker_count,
             ),
@@ -1119,6 +1366,7 @@ def download_progress_message(
     completed: int,
     total: int,
     downloaded_bytes: int,
+    expected_bytes: int,
     started_at: float,
     worker_count: int,
 ) -> str:
@@ -1126,9 +1374,12 @@ def download_progress_message(
     eta = estimate_remaining(completed, total, elapsed)
     message_rate = completed / elapsed
     byte_rate = int(downloaded_bytes / elapsed)
+    byte_progress = format_bytes(downloaded_bytes)
+    if expected_bytes > 0:
+        byte_progress += f"/{format_bytes(expected_bytes)}"
     return (
         f"{mailbox_name} {progress_bar(completed, total)} downloads {completed}/{total} "
-        f"| {format_bytes(downloaded_bytes)} | {message_rate:.1f}/s | {format_bytes(byte_rate)}/s "
+        f"| {byte_progress} | {message_rate:.1f}/s | {format_bytes(byte_rate)}/s "
         f"| elapsed {format_duration(elapsed)} | ETA {format_duration(eta)} | {worker_count} workers"
     )
 
@@ -1206,7 +1457,7 @@ def sync_mailbox(
     mailbox: Mailbox,
     email_root: Path,
     existing_files: dict[str, Path],
-    index: dict[str, Any],
+    state_store: StateStore,
     stats: dict[str, int],
     status: LiveStatus,
     *,
@@ -1214,7 +1465,7 @@ def sync_mailbox(
 ) -> None:
     raw_dir = email_root / "raw"
     message_count, uidvalidity = select_mailbox(connection, mailbox)
-    state = mailbox_state(index, mailbox.display_name)
+    state = state_store.get_mailbox_state(mailbox.display_name)
     last_seen_uid = int_from_state(state.get("last_seen_uid"))
     backfill_before_uid = int_from_state(state.get("backfill_before_uid"))
     same_uidvalidity = uidvalidity is not None and state.get("uidvalidity") == uidvalidity
@@ -1236,30 +1487,30 @@ def sync_mailbox(
         status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, full newest-first scan)")
 
     uids = search_uids(connection, start_uid=start_uid, end_uid=end_uid)
-    messages: dict[str, dict[str, Any]] = index["messages"]
     dirty_count = 0
 
     if not uids:
+        updates: dict[str, Any] = {"last_completed_at": iso_now()}
         if uidvalidity is not None:
-            state["uidvalidity"] = uidvalidity
+            updates["uidvalidity"] = uidvalidity
         if sync_mode in {"full", "backfill"}:
             scan_highest_uid = int_from_state(state.get("scan_highest_uid"))
             if scan_highest_uid is not None:
-                state["last_seen_uid"] = scan_highest_uid
+                updates["last_seen_uid"] = scan_highest_uid
             elif last_seen_uid is None:
-                state["last_seen_uid"] = 0
-            state["backfill_complete"] = True
-            state.pop("backfill_before_uid", None)
-            state.pop("scan_highest_uid", None)
-        state["last_completed_at"] = iso_now()
-        save_message_index(email_root / "_state" / "message_index.json", index)
+                updates["last_seen_uid"] = 0
+            updates["backfill_complete"] = True
+            updates["backfill_before_uid"] = None
+            updates["scan_highest_uid"] = None
+        state_store.update_mailbox_state(mailbox.display_name, **updates)
+        state_store.commit()
         status.line(f"  No new messages in {mailbox.display_name}")
         return
 
     if sync_mode == "full":
         state["backfill_complete"] = False
         state["scan_highest_uid"] = max_uid_value(uids)
-        state.pop("backfill_before_uid", None)
+        state["backfill_before_uid"] = None
 
     mailbox_started_at = datetime.now().timestamp()
     baseline = {
@@ -1269,10 +1520,17 @@ def sync_mailbox(
     }
     status.update(mailbox_progress_message(mailbox.display_name, 0, len(uids), mailbox_started_at, stats, baseline), force=True)
 
-    for batch_number, uid_batch in enumerate(batched(uids, METADATA_BATCH_SIZE), start=1):
+    offset = 0
+    while offset < len(uids):
+        current_batch_size = clamp_metadata_batch_size(
+            int_from_stats(stats, "metadata_batch_size", DEFAULT_METADATA_BATCH_SIZE)
+        )
+        stats["metadata_batch_size"] = current_batch_size
+        uid_batch = uids[offset : offset + current_batch_size]
         batch_failed = False
+        metadata_fallback = False
         pending_downloads: list[PendingDownload] = []
-        processed_before_batch = min((batch_number - 1) * METADATA_BATCH_SIZE, len(uids))
+        processed_before_batch = offset
 
         status.update(
             mailbox_progress_message(
@@ -1283,14 +1541,29 @@ def sync_mailbox(
                 stats,
                 baseline,
             )
-            + " | metadata",
+            + f" | metadata {len(uid_batch)}",
             force=True,
         )
 
         try:
             metadata_by_uid = fetch_metadata_batch(connection, uid_batch)
         except Exception as exc:
-            status.line(f"  Metadata batch failed in {mailbox.display_name}: {exc}")
+            next_batch_size = reduced_metadata_batch_size(current_batch_size)
+            if next_batch_size < current_batch_size:
+                stats["metadata_batch_size"] = next_batch_size
+                stats["metadata_batch_backoffs"] += 1
+                stats["metadata_batch_successes"] = 0
+                status.line(
+                    f"  Metadata batch of {len(uid_batch)} UIDs failed in {mailbox.display_name}; "
+                    f"retrying with {next_batch_size}. {format_exception(exc)}"
+                )
+                continue
+
+            metadata_fallback = True
+            status.line(
+                f"  Metadata batch failed at {current_batch_size} UIDs in {mailbox.display_name}; "
+                f"fetching one UID at a time. {format_exception(exc)}"
+            )
             metadata_by_uid = {}
             for uid in uid_batch:
                 try:
@@ -1301,20 +1574,23 @@ def sync_mailbox(
                     uid_text = uid.decode("ascii", "replace")
                     status.line(f"  Error on {mailbox.display_name} UID {uid_text}: {item_exc}")
 
+        messages_by_id = state_store.get_messages(
+            [metadata.gmail_msg_id for metadata in metadata_by_uid.values()]
+        )
+
         for uid in uid_batch:
             metadata = metadata_by_uid.get(uid)
             if metadata is None:
                 continue
 
-            entry = messages.get(metadata.gmail_msg_id)
+            entry = messages_by_id.get(metadata.gmail_msg_id)
 
             if isinstance(entry, dict):
                 existing_path = message_file_exists(email_root, entry)
                 if existing_path is not None:
-                    if merge_label(entry, mailbox.display_name):
+                    if state_store.mark_seen(metadata.gmail_msg_id, mailbox.display_name):
                         stats["labels_merged"] += 1
-                        dirty_count += 1
-                    entry["last_seen_at"] = iso_now()
+                    dirty_count += 1
                     stats["skipped"] += 1
                     continue
 
@@ -1327,12 +1603,10 @@ def sync_mailbox(
                         mailbox.display_name,
                         downloaded_at=entry.get("downloaded_at"),
                     )
-                    labels = entry.get("labels", [])
-                    if isinstance(labels, list):
-                        for label in labels:
-                            if isinstance(label, str):
-                                merge_label(replacement, label)
-                    messages[metadata.gmail_msg_id] = replacement
+                    restore_existing_labels(replacement, entry)
+                    state_store.upsert_message(replacement)
+                    messages_by_id[metadata.gmail_msg_id] = replacement
+                    existing_files[metadata.gmail_msg_id] = existing_by_id
                     stats["indexed_existing"] += 1
                     dirty_count += 1
                     continue
@@ -1352,13 +1626,16 @@ def sync_mailbox(
             else:
                 existing_by_id = find_existing_message_file(existing_files, metadata.gmail_msg_id)
                 if existing_by_id is not None:
-                    messages[metadata.gmail_msg_id] = index_entry_for_file(
+                    entry = index_entry_for_file(
                         metadata,
                         existing_by_id,
                         email_root,
                         mailbox.display_name,
                         downloaded_at=None,
                     )
+                    state_store.upsert_message(entry)
+                    messages_by_id[metadata.gmail_msg_id] = entry
+                    existing_files[metadata.gmail_msg_id] = existing_by_id
                     stats["indexed_existing"] += 1
                     dirty_count += 1
                     continue
@@ -1367,13 +1644,15 @@ def sync_mailbox(
             final_path = raw_dir / filename
 
             if final_path.exists():
-                messages[metadata.gmail_msg_id] = index_entry_for_file(
+                entry = index_entry_for_file(
                     metadata,
                     final_path,
                     email_root,
                     mailbox.display_name,
                     downloaded_at=None,
                 )
+                state_store.upsert_message(entry)
+                messages_by_id[metadata.gmail_msg_id] = entry
                 existing_files[metadata.gmail_msg_id] = final_path
                 stats["indexed_existing"] += 1
                 dirty_count += 1
@@ -1416,7 +1695,8 @@ def sync_mailbox(
                 downloaded_at=outcome.downloaded_at,
             )
             restore_existing_labels(entry, pending.previous_entry)
-            messages[pending.metadata.gmail_msg_id] = entry
+            state_store.upsert_message(entry)
+            messages_by_id[pending.metadata.gmail_msg_id] = entry
             existing_files[pending.metadata.gmail_msg_id] = pending.final_path
             stats["downloaded_bytes"] += outcome.byte_size
             if pending.restoring:
@@ -1426,27 +1706,41 @@ def sync_mailbox(
             dirty_count += 1
 
         if batch_failed:
-            save_message_index(email_root / "_state" / "message_index.json", index)
+            state_store.commit()
             status.line(
                 f"  Stopped {mailbox.display_name} after a failed batch. "
                 "Next run will resume from the last completed UID."
             )
             return
 
+        checkpoint: dict[str, Any] = {"last_completed_at": iso_now()}
         if uidvalidity is not None:
-            state["uidvalidity"] = uidvalidity
+            checkpoint["uidvalidity"] = uidvalidity
         if sync_mode == "incremental":
-            state["last_seen_uid"] = max(max_uid_value(uid_batch), last_seen_uid or 0)
-            state["backfill_complete"] = True
+            checkpoint["backfill_complete"] = True
         else:
-            state["backfill_before_uid"] = min_uid_value(uid_batch)
-        state["last_completed_at"] = iso_now()
+            checkpoint["backfill_before_uid"] = min_uid_value(uid_batch)
+            checkpoint["backfill_complete"] = False
+            checkpoint["scan_highest_uid"] = state.get("scan_highest_uid")
+        state_store.update_mailbox_state(mailbox.display_name, **checkpoint)
         dirty_count += 1
+        offset += len(uid_batch)
+
+        if metadata_fallback:
+            stats["metadata_batch_successes"] = 0
+        else:
+            stats["metadata_batch_successes"] += 1
+            if stats["metadata_batch_successes"] >= METADATA_BATCH_GROW_AFTER:
+                next_batch_size = increased_metadata_batch_size(current_batch_size)
+                if next_batch_size > current_batch_size:
+                    stats["metadata_batch_size"] = next_batch_size
+                    stats["metadata_batch_growths"] += 1
+                stats["metadata_batch_successes"] = 0
 
         status.update(
             mailbox_progress_message(
                 mailbox.display_name,
-                min(batch_number * METADATA_BATCH_SIZE, len(uids)),
+                offset,
                 len(uids),
                 mailbox_started_at,
                 stats,
@@ -1455,23 +1749,38 @@ def sync_mailbox(
             force=True,
         )
 
-        if dirty_count >= 50:
-            save_message_index(email_root / "_state" / "message_index.json", index)
+        if dirty_count >= DB_COMMIT_EVERY:
+            state_store.commit()
             dirty_count = 0
 
     if dirty_count:
-        save_message_index(email_root / "_state" / "message_index.json", index)
-    if sync_mode in {"full", "backfill"}:
+        state_store.commit()
+    if sync_mode == "incremental":
+        final_updates = {
+            "last_seen_uid": max(max_uid_value(uids), last_seen_uid or 0),
+            "backfill_complete": True,
+            "last_completed_at": iso_now(),
+        }
+        if uidvalidity is not None:
+            final_updates["uidvalidity"] = uidvalidity
+        state_store.update_mailbox_state(mailbox.display_name, **final_updates)
+        state_store.commit()
+    elif sync_mode in {"full", "backfill"}:
         scan_highest_uid = int_from_state(state.get("scan_highest_uid"))
+        final_updates: dict[str, Any] = {
+            "backfill_complete": True,
+            "backfill_before_uid": None,
+            "scan_highest_uid": None,
+            "last_completed_at": iso_now(),
+        }
         if scan_highest_uid is not None:
-            state["last_seen_uid"] = scan_highest_uid
+            final_updates["last_seen_uid"] = scan_highest_uid
         elif uids:
-            state["last_seen_uid"] = max_uid_value(uids)
-        state["backfill_complete"] = True
-        state.pop("backfill_before_uid", None)
-        state.pop("scan_highest_uid", None)
-        state["last_completed_at"] = iso_now()
-        save_message_index(email_root / "_state" / "message_index.json", index)
+            final_updates["last_seen_uid"] = max_uid_value(uids)
+        if uidvalidity is not None:
+            final_updates["uidvalidity"] = uidvalidity
+        state_store.update_mailbox_state(mailbox.display_name, **final_updates)
+        state_store.commit()
     status.line(f"  Completed {mailbox.display_name}: {len(uids)} UIDs checked")
 
 
@@ -1489,56 +1798,64 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
     if existing_files:
         status.line(f"Indexed {len(existing_files)} existing raw email files.")
 
-    index_path = email_root / "_state" / "message_index.json"
-    index = load_message_index(index_path)
-    mailboxes = list_selectable_mailboxes(connection)
-    if not mailboxes:
-        raise RuntimeError("No selectable Gmail mailboxes were found.")
-    force_full_scan = indexed_file_missing(email_root, index)
-    if force_full_scan:
-        status.line("Missing indexed .eml files found; using full scans so missing messages can be restored.")
+    state_store = StateStore(email_root)
+    try:
+        mailboxes = list_selectable_mailboxes(connection)
+        if not mailboxes:
+            raise RuntimeError("No selectable Gmail mailboxes were found.")
+        force_full_scan = state_store.has_missing_files()
+        if force_full_scan:
+            status.line("Missing indexed .eml files found; using full scans so missing messages can be restored.")
 
-    stats = {
-        "downloaded": 0,
-        "downloaded_bytes": 0,
-        "skipped": 0,
-        "restored_missing": 0,
-        "indexed_existing": 0,
-        "labels_merged": 0,
-        "errors": 0,
-        "download_workers": DEFAULT_DOWNLOAD_WORKERS,
-        "worker_backoffs": 0,
-    }
+        stats = {
+            "downloaded": 0,
+            "downloaded_bytes": 0,
+            "skipped": 0,
+            "restored_missing": 0,
+            "indexed_existing": 0,
+            "labels_merged": 0,
+            "errors": 0,
+            "download_workers": DEFAULT_DOWNLOAD_WORKERS,
+            "worker_backoffs": 0,
+            "metadata_batch_size": DEFAULT_METADATA_BATCH_SIZE,
+            "metadata_batch_backoffs": 0,
+            "metadata_batch_growths": 0,
+            "metadata_batch_successes": 0,
+        }
 
-    processed_mailboxes: list[str] = []
-    for mailbox in mailboxes:
-        try:
-            sync_mailbox(
-                connection,
-                credentials,
-                mailbox,
-                email_root,
-                existing_files,
-                index,
-                stats,
-                status,
-                force_full_scan=force_full_scan,
-            )
-            processed_mailboxes.append(mailbox.display_name)
-        except Exception as exc:
-            status.line()
-            stats["errors"] += 1
-            print(f"Mailbox error for {mailbox.display_name}: {exc}")
+        processed_mailboxes: list[str] = []
+        for mailbox in mailboxes:
+            try:
+                sync_mailbox(
+                    connection,
+                    credentials,
+                    mailbox,
+                    email_root,
+                    existing_files,
+                    state_store,
+                    stats,
+                    status,
+                    force_full_scan=force_full_scan,
+                )
+                processed_mailboxes.append(mailbox.display_name)
+            except Exception as exc:
+                status.line()
+                stats["errors"] += 1
+                print(f"Mailbox error for {mailbox.display_name}: {exc}")
 
-    status.done()
-    save_message_index(index_path, index)
+        status.done()
+        state_store.commit()
 
-    return {
-        **stats,
-        "removed_part_files": removed_part_files,
-        "mailboxes_processed": processed_mailboxes,
-        "total_messages_indexed": len(index["messages"]),
-    }
+        summary = {
+            **stats,
+            "removed_part_files": removed_part_files,
+            "mailboxes_processed": processed_mailboxes,
+            "total_messages_indexed": state_store.count_messages(),
+        }
+        summary.pop("metadata_batch_successes", None)
+        return summary
+    finally:
+        state_store.close()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1590,6 +1907,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Errors: {summary['errors']}")
         print(f"  Final workers: {summary['download_workers']}")
         print(f"  Worker backoffs: {summary['worker_backoffs']}")
+        print(f"  Final metadata batch size: {summary['metadata_batch_size']}")
+        print(f"  Metadata batch backoffs: {summary['metadata_batch_backoffs']}")
+        print(f"  Metadata batch growths: {summary['metadata_batch_growths']}")
         print(f"  Partial files cleaned: {summary['removed_part_files']}")
         print(f"  Raw emails: {email_root / 'raw'}")
         return 0 if summary["errors"] == 0 else 1

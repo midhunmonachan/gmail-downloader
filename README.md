@@ -18,8 +18,10 @@ Downloads use parallel IMAP workers by default. The worker count is chosen from 
 
 The script also:
 
-- Fetches message metadata in batches of 500 UIDs.
+- Fetches message metadata in adaptive batches up to 1000 UIDs, backing down when Gmail rejects a large batch and growing again after stable batches.
 - Pre-indexes existing `.eml` filenames once at startup instead of scanning the filesystem per message.
+- Stores message and mailbox state in SQLite for faster lookups as the archive grows.
+- Queues larger raw emails first inside each batch so parallel workers spend less time waiting on one large message at the end.
 - Downloads missing raw emails in parallel.
 - Automatically backs down worker count when Gmail reports known retryable connection/rate-limit errors.
 - Processes Gmail UIDs from highest to lowest so newer messages are queued first.
@@ -57,7 +59,7 @@ emails/
   raw/
     2026-04-30__187fabc123456789.eml
   _state/
-    message_index.json
+    message_index.sqlite3
     sync_state.json
 ```
 
@@ -89,7 +91,7 @@ On rerun:
 - Existing indexed `.eml` files are skipped.
 - Missing `.eml` files are downloaded again.
 - Messages that appear in multiple Gmail labels are stored once.
-- Label/mailbox sightings are merged into `emails/_state/message_index.json`.
+- Label/mailbox sightings are merged into `emails/_state/message_index.sqlite3`.
 
 ## Standalone Script Use
 
@@ -105,7 +107,8 @@ When copied outside the repo layout, the script still behaves like a normal CLI:
 ```text
 ~/.config/gmail-downloader/email.json
 ./emails/raw/*.eml
-./emails/_state/*.json
+./emails/_state/message_index.sqlite3
+./emails/_state/sync_state.json
 ```
 
 You can override paths:
