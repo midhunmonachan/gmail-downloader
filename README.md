@@ -12,6 +12,21 @@ Each `.eml` file is the original raw email message. Attachments and inline image
 
 No Python packages need to be installed. The script uses only the Python standard library.
 
+## Performance
+
+Downloads use parallel IMAP workers by default. The worker count is chosen from the machine CPU count and capped at 12 worker connections, leaving room for the main metadata connection and other mail clients.
+
+The script also:
+
+- Fetches message metadata in batches.
+- Downloads missing raw emails in parallel.
+- Computes SHA-256 while writing each `.eml` file.
+- Stores per-mailbox resume markers so later runs skip already-scanned UID ranges.
+- Shows live progress while scanning and downloading.
+- Removes stale `.part` files at startup and on exit.
+
+Google documents a Gmail IMAP download bandwidth limit of 2500 MB per day for Workspace accounts: <https://support.google.com/a/answer/1071518>.
+
 ## Quick Start
 
 Run from a cloned repo:
@@ -105,6 +120,12 @@ You can also use environment variables:
 GMAIL_DOWNLOADER_CONFIG="$HOME/private/gmail.json" \
 GMAIL_DOWNLOADER_EMAILS_DIR="$HOME/gmail-archive" \
 python3 scripts/email/downloader.py
+```
+
+To override the automatic worker count without adding a command-line option:
+
+```bash
+GMAIL_DOWNLOADER_WORKERS=8 python3 scripts/email/downloader.py
 ```
 
 ## Gmail Setup Notes

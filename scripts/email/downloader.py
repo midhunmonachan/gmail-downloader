@@ -12,10 +12,11 @@ import os
 import re
 import socket
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Any
 
 
@@ -23,6 +24,12 @@ IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT_SECONDS = 30
 APP_NAME = "gmail-downloader"
+METADATA_BATCH_SIZE = 100
+GMAIL_IMAP_CONNECTION_LIMIT = 15
+RESERVED_IMAP_CONNECTIONS = 2
+MAIN_IMAP_CONNECTIONS = 1
+MAX_DOWNLOAD_WORKERS = max(1, GMAIL_IMAP_CONNECTION_LIMIT - RESERVED_IMAP_CONNECTIONS - MAIN_IMAP_CONNECTIONS)
+STATUS_REFRESH_SECONDS = 0.2
 
 
 def default_config_path() -> Path:
@@ -45,14 +52,31 @@ def default_email_root() -> Path:
     return Path.cwd() / "emails"
 
 
+def default_download_workers() -> int:
+    cpu_count = os.cpu_count() or 1
+    machine_workers = max(4, cpu_count * 4)
+
+    env_value = os.environ.get("GMAIL_DOWNLOADER_WORKERS")
+    if env_value:
+        try:
+            requested_workers = int(env_value)
+        except ValueError:
+            requested_workers = machine_workers
+        machine_workers = max(1, requested_workers)
+
+    return max(1, min(machine_workers, MAX_DOWNLOAD_WORKERS))
+
+
 DEFAULT_CONFIG_PATH = default_config_path()
 DEFAULT_EMAIL_ROOT = default_email_root()
+DEFAULT_DOWNLOAD_WORKERS = default_download_workers()
 
 APP_PASSWORD_LENGTH = 16
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 FETCH_GMAIL_ID_RE = re.compile(rb"X-GM-MSGID\s+(\d+)")
 FETCH_INTERNALDATE_RE = re.compile(rb'INTERNALDATE\s+"([^"]+)"')
 FETCH_SIZE_RE = re.compile(rb"RFC822\.SIZE\s+(\d+)")
+FETCH_UID_RE = re.compile(rb"\bUID\s+(\d+)")
 LIST_RE = re.compile(
     rb"^\((?P<flags>[^)]*)\)\s+(?P<delimiter>NIL|\"(?:\\.|[^\"])*\")\s+(?P<name>.+)$",
     re.IGNORECASE,
@@ -79,12 +103,63 @@ class MessageMetadata:
     rfc822_size: int | None
 
 
+@dataclass(frozen=True)
+class PendingDownload:
+    uid: bytes
+    metadata: MessageMetadata
+    final_path: Path
+    mailbox_name: str
+    previous_entry: dict[str, Any] | None
+    restoring: bool
+
+
+@dataclass(frozen=True)
+class DownloadOutcome:
+    pending: PendingDownload
+    byte_size: int | None
+    sha256: str | None
+    downloaded_at: str | None
+    error: str | None
+
+
 class CredentialError(RuntimeError):
     """Raised when credential validation should be retried."""
 
 
 class NetworkValidationError(RuntimeError):
     """Raised when credentials cannot be tested because Gmail is unreachable."""
+
+
+class LiveStatus:
+    def __init__(self) -> None:
+        self.enabled = sys.stdout.isatty()
+        self.last_message = ""
+        self.last_update = 0.0
+
+    def update(self, message: str, *, force: bool = False) -> None:
+        now = datetime.now().timestamp()
+        if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
+            return
+        previous = self.last_message
+        self.last_message = message
+        self.last_update = now
+        if self.enabled:
+            width = max(len(message), len(previous))
+            print("\r" + message.ljust(width), end="", flush=True)
+        else:
+            print(message, flush=True)
+
+    def line(self, message: str = "") -> None:
+        if self.enabled and self.last_message:
+            print("\r" + " " * len(self.last_message) + "\r", end="", flush=True)
+            self.last_message = ""
+        if message:
+            print(message, flush=True)
+
+    def done(self) -> None:
+        if self.enabled and self.last_message:
+            print()
+            self.last_message = ""
 
 
 class CompactHelpParser(argparse.ArgumentParser):
@@ -98,12 +173,14 @@ class CompactHelpParser(argparse.ArgumentParser):
                 "  --config CONFIG             path to credential JSON",
                 "  --emails-dir DIR            archive output directory",
                 "  --output-dir DIR            alias for --emails-dir",
+                f"  parallel downloads:        {DEFAULT_DOWNLOAD_WORKERS}",
                 "Defaults:",
                 f"  config:     {DEFAULT_CONFIG_PATH}",
                 f"  output dir: {DEFAULT_EMAIL_ROOT}",
                 "Environment overrides:",
                 "  GMAIL_DOWNLOADER_CONFIG",
                 "  GMAIL_DOWNLOADER_EMAILS_DIR",
+                "  GMAIL_DOWNLOADER_WORKERS",
             ]
         ) + "\n"
 
@@ -114,6 +191,15 @@ def utc_now() -> datetime:
 
 def iso_now() -> str:
     return utc_now().isoformat()
+
+
+def format_bytes(byte_count: int) -> str:
+    value = float(byte_count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{byte_count} B"
 
 
 def load_json(path: Path, default: Any, *, strict: bool = False) -> Any:
@@ -153,6 +239,23 @@ def write_json_atomic(path: Path, data: Any, *, mode: int | None = None) -> None
         except OSError:
             pass
         raise RuntimeError(f"Could not write {path}: {exc}") from exc
+
+
+def cleanup_part_files(email_root: Path) -> int:
+    raw_dir = email_root / "raw"
+    if not raw_dir.exists():
+        return 0
+
+    removed = 0
+    for path in raw_dir.glob(".*.part"):
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"Warning: could not remove partial download {path}: {exc}")
+    return removed
 
 
 def normalize_app_password(app_password: str) -> str:
@@ -382,8 +485,12 @@ def list_selectable_mailboxes(connection: imaplib.IMAP4_SSL) -> list[Mailbox]:
     return mailboxes
 
 
-def search_all_uids(connection: imaplib.IMAP4_SSL) -> list[bytes]:
-    status, data = connection.uid("SEARCH", None, "ALL")
+def search_uids(connection: imaplib.IMAP4_SSL, *, start_uid: int | None = None) -> list[bytes]:
+    if start_uid is None:
+        status, data = connection.uid("SEARCH", None, "ALL")
+    else:
+        status, data = connection.uid("SEARCH", None, "UID", f"{start_uid}:*")
+
     if status != "OK":
         raise RuntimeError(f"Could not search selected mailbox: {data!r}")
     if not data or not data[0]:
@@ -415,12 +522,11 @@ def parse_internal_date(raw_value: bytes | None) -> datetime:
     return parsed
 
 
-def fetch_message_metadata(connection: imaplib.IMAP4_SSL, uid: bytes) -> MessageMetadata:
-    status, data = connection.uid("FETCH", uid, "(X-GM-MSGID INTERNALDATE RFC822.SIZE)")
-    if status != "OK":
-        raise RuntimeError(f"Could not fetch metadata for UID {uid.decode('ascii', 'replace')}: {data!r}")
+def parse_metadata_response(response: bytes) -> tuple[bytes, MessageMetadata]:
+    uid_match = FETCH_UID_RE.search(response)
+    if uid_match is None:
+        raise RuntimeError(f"Gmail did not return UID in metadata response: {response!r}")
 
-    response = combined_fetch_response(data)
     gmail_id_match = FETCH_GMAIL_ID_RE.search(response)
     if gmail_id_match is None:
         raise RuntimeError(
@@ -431,11 +537,58 @@ def fetch_message_metadata(connection: imaplib.IMAP4_SSL, uid: bytes) -> Message
     internal_date_match = FETCH_INTERNALDATE_RE.search(response)
     size_match = FETCH_SIZE_RE.search(response)
 
-    return MessageMetadata(
-        gmail_msg_id=gmail_id_match.group(1).decode("ascii"),
-        internal_date=parse_internal_date(internal_date_match.group(1) if internal_date_match else None),
-        rfc822_size=int(size_match.group(1)) if size_match else None,
+    return (
+        uid_match.group(1),
+        MessageMetadata(
+            gmail_msg_id=gmail_id_match.group(1).decode("ascii"),
+            internal_date=parse_internal_date(internal_date_match.group(1) if internal_date_match else None),
+            rfc822_size=int(size_match.group(1)) if size_match else None,
+        ),
     )
+
+
+def metadata_response_items(data: list[Any]) -> list[bytes]:
+    items: list[bytes] = []
+    for item in data:
+        if isinstance(item, bytes) and b"X-GM-MSGID" in item:
+            items.append(item)
+        elif isinstance(item, tuple):
+            combined = combined_fetch_response([item])
+            if b"X-GM-MSGID" in combined:
+                items.append(combined)
+    return items
+
+
+def uid_sequence_set(uids: list[bytes]) -> bytes:
+    return b",".join(uids)
+
+
+def batched(items: list[bytes], size: int) -> list[list[bytes]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def fetch_metadata_batch(connection: imaplib.IMAP4_SSL, uids: list[bytes]) -> dict[bytes, MessageMetadata]:
+    if not uids:
+        return {}
+
+    status, data = connection.uid("FETCH", uid_sequence_set(uids), "(UID X-GM-MSGID INTERNALDATE RFC822.SIZE)")
+    if status != "OK":
+        raise RuntimeError(f"Could not fetch metadata batch: {data!r}")
+
+    metadata_by_uid: dict[bytes, MessageMetadata] = {}
+    for response in metadata_response_items(data):
+        uid, metadata = parse_metadata_response(response)
+        metadata_by_uid[uid] = metadata
+
+    missing_uids = [uid.decode("ascii", "replace") for uid in uids if uid not in metadata_by_uid]
+    if missing_uids:
+        raise RuntimeError(f"Gmail did not return metadata for UIDs: {', '.join(missing_uids)}")
+
+    return metadata_by_uid
+
+
+def fetch_message_metadata(connection: imaplib.IMAP4_SSL, uid: bytes) -> MessageMetadata:
+    return fetch_metadata_batch(connection, [uid])[uid]
 
 
 def fetch_raw_message(connection: imaplib.IMAP4_SSL, uid: bytes) -> bytes:
@@ -448,10 +601,6 @@ def fetch_raw_message(connection: imaplib.IMAP4_SSL, uid: bytes) -> bytes:
             return item[1]
 
     raise RuntimeError(f"Gmail returned no raw email body for UID {uid.decode('ascii', 'replace')}")
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -532,14 +681,53 @@ def index_entry_for_file(
     return entry
 
 
-def write_raw_message(path: Path, content: bytes) -> None:
+def index_entry_for_download(
+    metadata: MessageMetadata,
+    path: Path,
+    email_root: Path,
+    mailbox_name: str,
+    *,
+    byte_size: int,
+    sha256: str,
+    downloaded_at: str,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "gmail_msg_id": metadata.gmail_msg_id,
+        "filename": path.name,
+        "path": path.relative_to(email_root).as_posix(),
+        "internal_date": metadata.internal_date.isoformat(),
+        "labels": [mailbox_name],
+        "byte_size": byte_size,
+        "sha256": sha256,
+        "downloaded_at": downloaded_at,
+        "last_seen_at": iso_now(),
+    }
+
+    if metadata.rfc822_size is not None:
+        entry["gmail_rfc822_size"] = metadata.rfc822_size
+
+    return entry
+
+
+def write_raw_message(path: Path, content: bytes) -> tuple[int, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.part")
+    digest = hashlib.sha256()
 
-    with temp_path.open("wb") as handle:
-        handle.write(content)
+    try:
+        with temp_path.open("wb") as handle:
+            digest.update(content)
+            handle.write(content)
 
-    os.replace(temp_path, path)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    return len(content), digest.hexdigest()
 
 
 def empty_message_index() -> dict[str, Any]:
@@ -547,6 +735,7 @@ def empty_message_index() -> dict[str, Any]:
         "version": 1,
         "updated_at": iso_now(),
         "messages": {},
+        "mailboxes": {},
     }
 
 
@@ -570,36 +759,283 @@ def write_sync_state(email_root: Path, summary: dict[str, Any]) -> None:
     write_json_atomic(email_root / "_state" / "sync_state.json", summary)
 
 
-def select_mailbox(connection: imaplib.IMAP4_SSL, mailbox: Mailbox) -> int:
+def selected_uidvalidity(connection: imaplib.IMAP4_SSL) -> str | None:
+    status, data = connection.response("UIDVALIDITY")
+    if status != "OK" or not data:
+        return None
+
+    for item in data:
+        if not isinstance(item, bytes):
+            continue
+        match = re.search(rb"(\d+)", item)
+        if match:
+            return match.group(1).decode("ascii")
+    return None
+
+
+def select_mailbox(connection: imaplib.IMAP4_SSL, mailbox: Mailbox) -> tuple[int, str | None]:
     status, data = connection.select(mailbox.select_arg, readonly=True)
     if status != "OK":
         raise RuntimeError(f"Could not select mailbox {mailbox.display_name!r}: {data!r}")
+    uidvalidity = selected_uidvalidity(connection)
     if data and data[0] is not None:
         try:
-            return int(data[0])
+            return int(data[0]), uidvalidity
         except (TypeError, ValueError):
-            return 0
-    return 0
+            return 0, uidvalidity
+    return 0, uidvalidity
+
+
+def indexed_file_missing(email_root: Path, index: dict[str, Any]) -> bool:
+    messages = index.get("messages")
+    if not isinstance(messages, dict):
+        return False
+
+    for entry in messages.values():
+        if isinstance(entry, dict) and message_file_exists(email_root, entry) is None:
+            return True
+    return False
+
+
+def mailbox_states(index: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    states = index.setdefault("mailboxes", {})
+    if not isinstance(states, dict):
+        states = {}
+        index["mailboxes"] = states
+    return states
+
+
+def mailbox_state(index: dict[str, Any], mailbox_name: str) -> dict[str, Any]:
+    states = mailbox_states(index)
+    state = states.setdefault(mailbox_name, {})
+    if not isinstance(state, dict):
+        state = {}
+        states[mailbox_name] = state
+    return state
+
+
+def int_from_state(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def max_uid_value(uids: list[bytes]) -> int:
+    return max(int(uid) for uid in uids)
+
+
+def restore_existing_labels(replacement: dict[str, Any], previous_entry: dict[str, Any] | None) -> None:
+    if previous_entry is None:
+        return
+
+    labels = previous_entry.get("labels", [])
+    if not isinstance(labels, list):
+        return
+
+    for label in labels:
+        if isinstance(label, str):
+            merge_label(replacement, label)
+
+
+def download_worker(
+    credentials: Credentials,
+    mailbox: Mailbox,
+    task_queue: Queue[PendingDownload | None],
+    result_queue: Queue[DownloadOutcome],
+) -> None:
+    connection: imaplib.IMAP4_SSL | None = None
+    connection_error: str | None = None
+
+    try:
+        connection = connect_and_login(credentials)
+        select_mailbox(connection, mailbox)
+    except Exception as exc:
+        connection_error = str(exc)
+
+    try:
+        while True:
+            pending = task_queue.get()
+            try:
+                if pending is None:
+                    return
+
+                if connection_error is not None:
+                    result_queue.put(
+                        DownloadOutcome(
+                            pending=pending,
+                            byte_size=None,
+                            sha256=None,
+                            downloaded_at=None,
+                            error=connection_error,
+                        )
+                    )
+                    continue
+
+                if connection is None:
+                    result_queue.put(
+                        DownloadOutcome(
+                            pending=pending,
+                            byte_size=None,
+                            sha256=None,
+                            downloaded_at=None,
+                            error="download worker did not open an IMAP connection",
+                        )
+                    )
+                    continue
+
+                raw_message = fetch_raw_message(connection, pending.uid)
+                byte_size, digest = write_raw_message(pending.final_path, raw_message)
+                result_queue.put(
+                    DownloadOutcome(
+                        pending=pending,
+                        byte_size=byte_size,
+                        sha256=digest,
+                        downloaded_at=iso_now(),
+                        error=None,
+                    )
+                )
+            except Exception as exc:
+                if pending is not None:
+                    result_queue.put(
+                        DownloadOutcome(
+                            pending=pending,
+                            byte_size=None,
+                            sha256=None,
+                            downloaded_at=None,
+                            error=str(exc),
+                        )
+                    )
+            finally:
+                task_queue.task_done()
+    finally:
+        close_connection(connection)
+
+
+def download_pending_messages(
+    credentials: Credentials,
+    mailbox: Mailbox,
+    pending_items: list[PendingDownload],
+    status: LiveStatus,
+) -> list[DownloadOutcome]:
+    if not pending_items:
+        return []
+
+    worker_count = min(DEFAULT_DOWNLOAD_WORKERS, len(pending_items))
+    task_queue: Queue[PendingDownload | None] = Queue()
+    result_queue: Queue[DownloadOutcome] = Queue()
+    outcomes: list[DownloadOutcome] = []
+    downloaded_bytes = 0
+
+    threads = [
+        Thread(
+            target=download_worker,
+            args=(credentials, mailbox, task_queue, result_queue),
+            daemon=True,
+        )
+        for _ in range(worker_count)
+    ]
+    for thread in threads:
+        thread.start()
+
+    for pending in pending_items:
+        task_queue.put(pending)
+    for _ in threads:
+        task_queue.put(None)
+
+    status.update(
+        f"{mailbox.display_name}: downloading 0/{len(pending_items)} messages with {worker_count} workers",
+        force=True,
+    )
+
+    while len(outcomes) < len(pending_items):
+        outcome = result_queue.get()
+        outcomes.append(outcome)
+        if outcome.byte_size is not None:
+            downloaded_bytes += outcome.byte_size
+        status.update(
+            f"{mailbox.display_name}: downloaded {len(outcomes)}/{len(pending_items)} pending messages "
+            f"({format_bytes(downloaded_bytes)})",
+            force=True,
+        )
+
+    task_queue.join()
+    for thread in threads:
+        thread.join()
+
+    return outcomes
 
 
 def sync_mailbox(
     connection: imaplib.IMAP4_SSL,
+    credentials: Credentials,
     mailbox: Mailbox,
     email_root: Path,
     index: dict[str, Any],
     stats: dict[str, int],
+    status: LiveStatus,
+    *,
+    force_full_scan: bool,
 ) -> None:
     raw_dir = email_root / "raw"
-    message_count = select_mailbox(connection, mailbox)
-    print(f"Mailbox: {mailbox.display_name} ({message_count} messages)")
+    message_count, uidvalidity = select_mailbox(connection, mailbox)
+    state = mailbox_state(index, mailbox.display_name)
+    last_seen_uid = int_from_state(state.get("last_seen_uid"))
+    can_resume = (
+        not force_full_scan
+        and uidvalidity is not None
+        and state.get("uidvalidity") == uidvalidity
+        and last_seen_uid is not None
+    )
+    start_uid = last_seen_uid + 1 if can_resume else None
 
-    uids = search_all_uids(connection)
+    if can_resume:
+        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, resuming after UID {last_seen_uid})")
+    else:
+        status.line(f"Mailbox: {mailbox.display_name} ({message_count} messages, full scan)")
+
+    uids = search_uids(connection, start_uid=start_uid)
     messages: dict[str, dict[str, Any]] = index["messages"]
     dirty_count = 0
 
-    for offset, uid in enumerate(uids, start=1):
+    if not uids:
+        if uidvalidity is not None:
+            state["uidvalidity"] = uidvalidity
+        state["last_completed_at"] = iso_now()
+        save_message_index(email_root / "_state" / "message_index.json", index)
+        status.line(f"  No new messages in {mailbox.display_name}")
+        return
+
+    for batch_number, uid_batch in enumerate(batched(uids, METADATA_BATCH_SIZE), start=1):
+        batch_failed = False
+        pending_downloads: list[PendingDownload] = []
+
+        status.update(
+            f"{mailbox.display_name}: reading metadata batch {batch_number} "
+            f"({min(batch_number * METADATA_BATCH_SIZE, len(uids))}/{len(uids)} UIDs)",
+            force=True,
+        )
+
         try:
-            metadata = fetch_message_metadata(connection, uid)
+            metadata_by_uid = fetch_metadata_batch(connection, uid_batch)
+        except Exception as exc:
+            status.line(f"  Metadata batch failed in {mailbox.display_name}: {exc}")
+            metadata_by_uid = {}
+            for uid in uid_batch:
+                try:
+                    metadata_by_uid[uid] = fetch_message_metadata(connection, uid)
+                except Exception as item_exc:
+                    stats["errors"] += 1
+                    batch_failed = True
+                    uid_text = uid.decode("ascii", "replace")
+                    status.line(f"  Error on {mailbox.display_name} UID {uid_text}: {item_exc}")
+
+        for uid in uid_batch:
+            metadata = metadata_by_uid.get(uid)
+            if metadata is None:
+                continue
+
             entry = messages.get(metadata.gmail_msg_id)
 
             if isinstance(entry, dict):
@@ -631,7 +1067,18 @@ def sync_mailbox(
                     dirty_count += 1
                     continue
 
-                stats["restored_missing"] += 1
+                final_path = raw_dir / filename_for_message(metadata)
+                pending_downloads.append(
+                    PendingDownload(
+                        uid=uid,
+                        metadata=metadata,
+                        final_path=final_path,
+                        mailbox_name=mailbox.display_name,
+                        previous_entry=entry,
+                        restoring=True,
+                    )
+                )
+                continue
             else:
                 existing_by_id = find_existing_message_file(raw_dir, metadata.gmail_msg_id)
                 if existing_by_id is not None:
@@ -646,7 +1093,6 @@ def sync_mailbox(
                     dirty_count += 1
                     continue
 
-            raw_message = fetch_raw_message(connection, uid)
             filename = filename_for_message(metadata)
             final_path = raw_dir / filename
 
@@ -662,30 +1108,71 @@ def sync_mailbox(
                 dirty_count += 1
                 continue
 
-            write_raw_message(final_path, raw_message)
-            entry = index_entry_for_file(
-                metadata,
-                final_path,
-                email_root,
-                mailbox.display_name,
-                downloaded_at=iso_now(),
+            pending_downloads.append(
+                PendingDownload(
+                    uid=uid,
+                    metadata=metadata,
+                    final_path=final_path,
+                    mailbox_name=mailbox.display_name,
+                    previous_entry=None,
+                    restoring=False,
+                )
             )
-            entry["sha256"] = sha256_bytes(raw_message)
-            entry["byte_size"] = len(raw_message)
-            messages[metadata.gmail_msg_id] = entry
-            stats["downloaded"] += 1
+
+        for outcome in download_pending_messages(credentials, mailbox, pending_downloads, status):
+            pending = outcome.pending
+            if outcome.error is not None:
+                stats["errors"] += 1
+                batch_failed = True
+                uid_text = pending.uid.decode("ascii", "replace")
+                status.line(f"  Error on {mailbox.display_name} UID {uid_text}: {outcome.error}")
+                continue
+
+            if outcome.byte_size is None or outcome.sha256 is None or outcome.downloaded_at is None:
+                stats["errors"] += 1
+                batch_failed = True
+                uid_text = pending.uid.decode("ascii", "replace")
+                status.line(f"  Error on {mailbox.display_name} UID {uid_text}: incomplete download result")
+                continue
+
+            entry = index_entry_for_download(
+                pending.metadata,
+                pending.final_path,
+                email_root,
+                pending.mailbox_name,
+                byte_size=outcome.byte_size,
+                sha256=outcome.sha256,
+                downloaded_at=outcome.downloaded_at,
+            )
+            restore_existing_labels(entry, pending.previous_entry)
+            messages[pending.metadata.gmail_msg_id] = entry
+            stats["downloaded_bytes"] += outcome.byte_size
+            if pending.restoring:
+                stats["restored_missing"] += 1
+            else:
+                stats["downloaded"] += 1
             dirty_count += 1
 
-        except Exception as exc:
-            stats["errors"] += 1
-            uid_text = uid.decode("ascii", "replace")
-            print(f"  Error on {mailbox.display_name} UID {uid_text}: {exc}")
-
-        if offset % 100 == 0:
-            print(
-                f"  Progress {offset}/{len(uids)}: "
-                f"downloaded={stats['downloaded']} skipped={stats['skipped']} errors={stats['errors']}"
+        if batch_failed:
+            save_message_index(email_root / "_state" / "message_index.json", index)
+            status.line(
+                f"  Stopped {mailbox.display_name} after a failed batch. "
+                "Next run will resume from the last completed UID."
             )
+            return
+
+        if uidvalidity is not None:
+            state["uidvalidity"] = uidvalidity
+        state["last_seen_uid"] = max_uid_value(uid_batch)
+        state["last_completed_at"] = iso_now()
+        dirty_count += 1
+
+        status.update(
+            f"{mailbox.display_name}: done {min(batch_number * METADATA_BATCH_SIZE, len(uids))}/{len(uids)} UIDs "
+            f"downloaded={stats['downloaded']} restored={stats['restored_missing']} "
+            f"bytes={format_bytes(stats['downloaded_bytes'])} skipped={stats['skipped']} errors={stats['errors']}",
+            force=True,
+        )
 
         if dirty_count >= 50:
             save_message_index(email_root / "_state" / "message_index.json", index)
@@ -693,21 +1180,31 @@ def sync_mailbox(
 
     if dirty_count:
         save_message_index(email_root / "_state" / "message_index.json", index)
+    status.line(f"  Completed {mailbox.display_name}: {len(uids)} UIDs checked")
 
 
-def download_archive(connection: imaplib.IMAP4_SSL, email_root: Path) -> dict[str, Any]:
+def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, email_root: Path) -> dict[str, Any]:
     email_root.mkdir(parents=True, exist_ok=True)
     (email_root / "_state").mkdir(parents=True, exist_ok=True)
     (email_root / "raw").mkdir(parents=True, exist_ok=True)
+    status = LiveStatus()
+
+    removed_part_files = cleanup_part_files(email_root)
+    if removed_part_files:
+        status.line(f"Removed {removed_part_files} stale partial download files.")
 
     index_path = email_root / "_state" / "message_index.json"
     index = load_message_index(index_path)
     mailboxes = list_selectable_mailboxes(connection)
     if not mailboxes:
         raise RuntimeError("No selectable Gmail mailboxes were found.")
+    force_full_scan = indexed_file_missing(email_root, index)
+    if force_full_scan:
+        status.line("Missing indexed .eml files found; using full scans so missing messages can be restored.")
 
     stats = {
         "downloaded": 0,
+        "downloaded_bytes": 0,
         "skipped": 0,
         "restored_missing": 0,
         "indexed_existing": 0,
@@ -718,16 +1215,28 @@ def download_archive(connection: imaplib.IMAP4_SSL, email_root: Path) -> dict[st
     processed_mailboxes: list[str] = []
     for mailbox in mailboxes:
         try:
-            sync_mailbox(connection, mailbox, email_root, index, stats)
+            sync_mailbox(
+                connection,
+                credentials,
+                mailbox,
+                email_root,
+                index,
+                stats,
+                status,
+                force_full_scan=force_full_scan,
+            )
             processed_mailboxes.append(mailbox.display_name)
         except Exception as exc:
+            status.line()
             stats["errors"] += 1
             print(f"Mailbox error for {mailbox.display_name}: {exc}")
 
+    status.done()
     save_message_index(index_path, index)
 
     return {
         **stats,
+        "removed_part_files": removed_part_files,
         "mailboxes_processed": processed_mailboxes,
         "total_messages_indexed": len(index["messages"]),
     }
@@ -762,8 +1271,8 @@ def main(argv: list[str] | None = None) -> int:
     connection: imaplib.IMAP4_SSL | None = None
 
     try:
-        _, connection = get_authenticated_connection(config_path)
-        summary = download_archive(connection, email_root)
+        credentials, connection = get_authenticated_connection(config_path)
+        summary = download_archive(credentials, connection, email_root)
         completed_at = iso_now()
         sync_state = {
             "last_started_at": started_at,
@@ -775,21 +1284,25 @@ def main(argv: list[str] | None = None) -> int:
 
         print("\nDone.")
         print(f"  Downloaded: {summary['downloaded']}")
+        print(f"  Downloaded bytes: {format_bytes(summary['downloaded_bytes'])}")
         print(f"  Skipped: {summary['skipped']}")
         print(f"  Restored missing: {summary['restored_missing']}")
         print(f"  Indexed existing: {summary['indexed_existing']}")
         print(f"  Errors: {summary['errors']}")
+        print(f"  Partial files cleaned: {summary['removed_part_files']}")
         print(f"  Raw emails: {email_root / 'raw'}")
         return 0 if summary["errors"] == 0 else 1
 
     except KeyboardInterrupt:
-        print("\nInterrupted. Partial .part files, if any, can be ignored or removed.")
+        removed_part_files = cleanup_part_files(email_root)
+        print(f"\nInterrupted. Removed {removed_part_files} partial download files.")
         write_sync_state(
             email_root,
             {
                 "last_started_at": started_at,
                 "last_completed_at": iso_now(),
                 "last_status": "interrupted",
+                "removed_part_files": removed_part_files,
             },
         )
         return 130
@@ -811,6 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         close_connection(connection)
+        cleanup_part_files(email_root)
 
 
 if __name__ == "__main__":
