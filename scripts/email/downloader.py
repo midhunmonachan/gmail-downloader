@@ -190,32 +190,35 @@ class LiveStatus:
         self.last_lines: list[str] = []
         self.last_update = 0.0
         self.current_message = ""
+        self.message_version = 0
+        self.rendered_version = 0
         self.animation_frame = 0
         self.animation_generation = 0
         self.animation_thread: Thread | None = None
+        self.deferred_thread: Thread | None = None
         self.cursor_hidden = False
         self.lock = RLock()
         atexit.register(self.restore_cursor)
 
     def update(self, message: str, *, force: bool = False) -> None:
-        now = datetime.now().timestamp()
-        if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
-            return
+        now = time.monotonic()
 
         with self.lock:
-            self.last_update = now
             self.current_message = message
-            self.animation_frame = 0
-            self.animation_generation += 1
-            if self.dynamic:
-                self.render_dynamic_locked(self.render_animation(message))
-                if "..." in message:
-                    self.start_animation_locked(self.animation_generation)
-            else:
-                print(message, flush=True)
+            self.message_version += 1
+
+            if not force and now - self.last_update < STATUS_REFRESH_SECONDS:
+                if self.dynamic:
+                    self.schedule_deferred_render_locked()
+                return
+
+            self.render_current_locked(now)
 
     def line(self, message: str = "") -> None:
         with self.lock:
+            self.current_message = ""
+            self.message_version += 1
+            self.rendered_version = self.message_version
             self.animation_generation += 1
             self.clear_dynamic_locked()
             self.show_cursor_locked()
@@ -224,6 +227,9 @@ class LiveStatus:
 
     def done(self) -> None:
         with self.lock:
+            self.current_message = ""
+            self.message_version += 1
+            self.rendered_version = self.message_version
             self.animation_generation += 1
             if self.dynamic and self.last_lines:
                 print()
@@ -263,6 +269,44 @@ class LiveStatus:
         self.clear_dynamic_locked()
         print("\n".join(lines), end="", flush=True)
         self.last_lines = lines
+
+    def render_current_locked(self, now: float | None = None) -> None:
+        self.last_update = now if now is not None else time.monotonic()
+        self.rendered_version = self.message_version
+        self.animation_frame = 0
+        self.animation_generation += 1
+        if self.dynamic:
+            self.render_dynamic_locked(self.render_animation(self.current_message))
+            if "..." in self.current_message:
+                self.start_animation_locked(self.animation_generation)
+        else:
+            print(self.current_message, flush=True)
+
+    def schedule_deferred_render_locked(self) -> None:
+        if self.deferred_thread is not None and self.deferred_thread.is_alive():
+            return
+
+        self.deferred_thread = Thread(target=self.deferred_render, daemon=True)
+        self.deferred_thread.start()
+
+    def deferred_render(self) -> None:
+        while True:
+            with self.lock:
+                if (
+                    not self.dynamic
+                    or not self.current_message
+                    or self.message_version == self.rendered_version
+                ):
+                    self.deferred_thread = None
+                    return
+
+                wait_seconds = STATUS_REFRESH_SECONDS - (time.monotonic() - self.last_update)
+                if wait_seconds <= 0:
+                    self.render_current_locked()
+                    self.deferred_thread = None
+                    return
+
+            time.sleep(min(wait_seconds, STATUS_REFRESH_SECONDS))
 
     def render_animation(self, message: str) -> str:
         if "..." not in message:
@@ -1491,7 +1535,7 @@ def download_pending_messages(
     mailbox: Mailbox,
     pending_items: list[PendingDownload],
     worker_count: int,
-    progress_callback: Callable[[int, int, int, int, int, int, int], None] | None = None,
+    progress_callback: Callable[[int, int, int, int, int, int, int, int, int], None] | None = None,
 ) -> list[DownloadOutcome]:
     if not pending_items:
         return []
@@ -1502,6 +1546,8 @@ def download_pending_messages(
     task_queue: Queue[PendingDownload | None] = Queue()
     result_queue: Queue[DownloadOutcome] = Queue()
     outcomes: list[DownloadOutcome] = []
+    successful_downloads = 0
+    newly_archived_downloads = 0
     downloaded_bytes = 0
     download_retries = 0
     worker_reconnects = 0
@@ -1523,13 +1569,26 @@ def download_pending_messages(
         task_queue.put(None)
 
     if progress_callback is not None:
-        progress_callback(0, len(pending_items), 0, expected_bytes, download_retries, worker_reconnects, worker_count)
+        progress_callback(
+            0,
+            len(pending_items),
+            0,
+            0,
+            0,
+            expected_bytes,
+            download_retries,
+            worker_reconnects,
+            worker_count,
+        )
 
     while len(outcomes) < len(pending_items):
         outcome = result_queue.get()
         outcomes.append(outcome)
         if outcome.byte_size is not None:
             downloaded_bytes += outcome.byte_size
+            successful_downloads += 1
+            if not outcome.pending.restoring:
+                newly_archived_downloads += 1
         download_retries += outcome.retries
         worker_reconnects += outcome.reconnects
         completed = len(outcomes)
@@ -1537,6 +1596,8 @@ def download_pending_messages(
             progress_callback(
                 completed,
                 len(pending_items),
+                successful_downloads,
+                newly_archived_downloads,
                 downloaded_bytes,
                 expected_bytes,
                 download_retries,
@@ -1557,22 +1618,31 @@ def download_with_adaptive_workers(
     pending_items: list[PendingDownload],
     status: LiveStatus,
     stats: dict[str, int],
-    progress_callback: Callable[[str], None] | None = None,
+    progress_callback: Callable[[str, bool], None] | None = None,
 ) -> list[DownloadOutcome]:
     remaining = pending_items
     completed: list[DownloadOutcome] = []
+    active_successful_downloads = 0
+    active_newly_archived = 0
+    active_downloaded_bytes = 0
 
     while remaining:
         worker_count = int_from_stats(stats, "download_workers", DEFAULT_DOWNLOAD_WORKERS)
+
         def on_download_progress(
             completed: int,
             total: int,
+            successful_downloads: int,
+            newly_archived_downloads: int,
             downloaded_bytes: int,
             expected_bytes: int,
             download_retries: int,
             worker_reconnects: int,
             _active_worker_count: int,
         ) -> None:
+            stats["active_downloaded"] = active_successful_downloads + successful_downloads
+            stats["active_archived"] = active_newly_archived + newly_archived_downloads
+            stats["active_downloaded_bytes"] = active_downloaded_bytes + downloaded_bytes
             if progress_callback is not None:
                 progress_callback(
                     download_activity(
@@ -1582,7 +1652,8 @@ def download_with_adaptive_workers(
                         expected_bytes,
                         download_retries,
                         worker_reconnects,
-                    )
+                    ),
+                    completed == total,
                 )
 
         outcomes = download_pending_messages(
@@ -1592,6 +1663,13 @@ def download_with_adaptive_workers(
             worker_count,
             progress_callback=on_download_progress,
         )
+        for outcome in outcomes:
+            if outcome.byte_size is None:
+                continue
+            active_successful_downloads += 1
+            active_downloaded_bytes += outcome.byte_size
+            if not outcome.pending.restoring:
+                active_newly_archived += 1
         stats["download_retries"] += sum(outcome.retries for outcome in outcomes)
         stats["worker_reconnects"] += sum(outcome.reconnects for outcome in outcomes)
         retryable = [
@@ -1634,12 +1712,21 @@ def mark_work_done(stats: dict[str, int], count: int = 1) -> None:
 
 
 def total_progress_message(stats: dict[str, int], started_at: float, activity: str = "") -> str:
-    done = stats.get("work_done", 0)
+    active_archived = stats.get("active_archived", 0)
+    done = stats.get("work_done", 0) + active_archived
     total = stats.get("work_total", 0)
+    if total > 0:
+        done = min(done, total)
     elapsed = elapsed_since(started_at)
     eta = estimate_remaining(done, total, elapsed)
-    byte_rate = int(stats["downloaded_bytes"] / elapsed)
-    downloaded = stats["downloaded"] + stats["restored_missing"] + stats["repaired_corrupt"]
+    downloaded_bytes = stats["downloaded_bytes"] + stats.get("active_downloaded_bytes", 0)
+    byte_rate = int(downloaded_bytes / elapsed)
+    downloaded = (
+        stats["downloaded"]
+        + stats["restored_missing"]
+        + stats["repaired_corrupt"]
+        + stats.get("active_downloaded", 0)
+    )
     current = activity or "checking for missing emails..."
 
     return "\n".join(
@@ -1647,7 +1734,7 @@ def total_progress_message(stats: dict[str, int], started_at: float, activity: s
             "Gmail Downloader",
             f"{progress_bar(done, total)} {progress_percent(done, total).strip()}  "
             f"{format_int(done)} / {format_int(total)} emails archived",
-            f"Downloaded {format_int(downloaded)} emails, {format_bytes(stats['downloaded_bytes'])}",
+            f"Downloaded {format_int(downloaded)} emails, {format_bytes(downloaded_bytes)}",
             f"Speed {format_bytes(byte_rate)}/s    Elapsed {format_duration(elapsed)}    "
             f"Left about {format_duration(eta)}",
             f"Current: {current}",
@@ -2029,17 +2116,22 @@ def sync_mailbox(
             mark_work_done(stats, newly_archived_without_download)
             status.update(total_progress_message(stats, operation_started_at, "checking email details..."), force=False)
 
-        def on_download_progress(activity: str) -> None:
-            status.update(total_progress_message(stats, operation_started_at, activity), force=False)
+        def on_download_progress(activity: str, force: bool = False) -> None:
+            status.update(total_progress_message(stats, operation_started_at, activity), force=force)
 
-        for outcome in download_with_adaptive_workers(
+        outcomes = download_with_adaptive_workers(
             credentials,
             mailbox,
             pending_downloads,
             status,
             stats,
             progress_callback=on_download_progress,
-        ):
+        )
+        stats["active_downloaded"] = 0
+        stats["active_downloaded_bytes"] = 0
+        stats["active_archived"] = 0
+
+        for outcome in outcomes:
             pending = outcome.pending
             if outcome.error is not None:
                 stats["errors"] += 1
@@ -2183,6 +2275,9 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             "work_done": 0,
             "work_total": 0,
             "account_message_total": 0,
+            "active_downloaded": 0,
+            "active_downloaded_bytes": 0,
+            "active_archived": 0,
         }
 
         mailboxes = list_selectable_mailboxes(connection)
@@ -2246,6 +2341,9 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
             "total_messages_indexed": state_store.count_messages(),
         }
         summary.pop("metadata_batch_successes", None)
+        summary.pop("active_downloaded", None)
+        summary.pop("active_downloaded_bytes", None)
+        summary.pop("active_archived", None)
         return summary
     finally:
         status.done()
