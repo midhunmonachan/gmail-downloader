@@ -132,8 +132,7 @@ class NetworkValidationError(RuntimeError):
 
 class LiveStatus:
     def __init__(self) -> None:
-        plain_status = os.environ.get("GMAIL_DOWNLOADER_PLAIN_STATUS", "").lower()
-        self.dynamic = plain_status not in {"1", "true", "yes", "on"}
+        self.dynamic = sys.stdout.isatty() and os.environ.get("TERM", "dumb").lower() != "dumb"
         self.last_message = ""
         self.last_width = 0
         self.last_update = 0.0
@@ -147,7 +146,7 @@ class LiveStatus:
         self.last_update = now
         if self.dynamic:
             print("\r" + message.ljust(self.last_width), end="", flush=True)
-        elif force:
+        else:
             print(message, flush=True)
 
     def line(self, message: str = "") -> None:
@@ -184,7 +183,6 @@ class CompactHelpParser(argparse.ArgumentParser):
                 "  GMAIL_DOWNLOADER_CONFIG",
                 "  GMAIL_DOWNLOADER_EMAILS_DIR",
                 "  GMAIL_DOWNLOADER_WORKERS",
-                "  GMAIL_DOWNLOADER_PLAIN_STATUS",
             ]
         ) + "\n"
 
