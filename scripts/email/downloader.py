@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,6 +175,14 @@ class MailboxPlan:
     start_uid: int | None
     end_uid: int | None
     uids: list[bytes]
+
+
+@dataclass(frozen=True)
+class MetadataBatchJob:
+    offset: int
+    batch_size: int
+    uids: list[bytes]
+    future: Future
 
 
 class CredentialError(RuntimeError):
@@ -866,6 +875,13 @@ def build_existing_file_lookup(raw_dir: Path) -> dict[str, Path]:
     return lookup
 
 
+def run_startup_file_tasks(email_root: Path) -> tuple[int, dict[str, Path]]:
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="gmail-startup") as executor:
+        cleanup_future = executor.submit(cleanup_part_files, email_root)
+        lookup_future = executor.submit(build_existing_file_lookup, email_root / "raw")
+        return cleanup_future.result(), lookup_future.result()
+
+
 def find_existing_message_file(existing_files: dict[str, Path], gmail_msg_id: str) -> Path | None:
     path = existing_files.get(gmail_msg_id)
     if path is not None and path.exists():
@@ -1388,6 +1404,63 @@ def open_worker_connection(credentials: Credentials, mailbox: Mailbox) -> imapli
     return connection
 
 
+class MetadataPrefetcher:
+    def __init__(self, credentials: Credentials, mailbox: Mailbox) -> None:
+        self.credentials = credentials
+        self.mailbox = mailbox
+        self.connection: imaplib.IMAP4_SSL | None = None
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gmail-metadata")
+        self.closed = False
+
+    def submit(self, uids: list[bytes]) -> Future:
+        return self.executor.submit(self.fetch, list(uids))
+
+    def fetch(self, uids: list[bytes]) -> dict[bytes, MessageMetadata]:
+        try:
+            if self.connection is None:
+                self.connection = open_worker_connection(self.credentials, self.mailbox)
+            return fetch_metadata_batch(self.connection, uids)
+        except Exception:
+            close_connection(self.connection)
+            self.connection = None
+            raise
+
+    def close(self) -> None:
+        if self.closed:
+            return
+
+        self.closed = True
+        try:
+            close_future = self.executor.submit(self.close_on_worker)
+        except RuntimeError:
+            return
+
+        self.executor.shutdown(wait=True)
+        try:
+            close_future.result()
+        except Exception:
+            pass
+
+    def close_on_worker(self) -> None:
+        close_connection(self.connection)
+        self.connection = None
+
+
+def schedule_metadata_batch(
+    prefetcher: MetadataPrefetcher,
+    offset: int,
+    uids: list[bytes],
+    batch_size: int,
+) -> MetadataBatchJob:
+    uid_batch = uids[offset : offset + batch_size]
+    return MetadataBatchJob(
+        offset=offset,
+        batch_size=batch_size,
+        uids=uid_batch,
+        future=prefetcher.submit(uid_batch),
+    )
+
+
 def download_pending_with_retries(
     credentials: Credentials,
     mailbox: Mailbox,
@@ -1530,6 +1603,123 @@ def download_worker(
         close_connection(connection)
 
 
+class DownloadWorkerPool:
+    def __init__(self, credentials: Credentials, mailbox: Mailbox, worker_count: int) -> None:
+        self.credentials = credentials
+        self.mailbox = mailbox
+        self.worker_count = max(1, worker_count)
+        self.task_queue: Queue[PendingDownload | None] = Queue()
+        self.result_queue: Queue[DownloadOutcome] = Queue()
+        self.closed = False
+        self.threads = [
+            Thread(
+                target=download_worker,
+                args=(credentials, mailbox, self.task_queue, self.result_queue),
+                daemon=True,
+            )
+            for _ in range(self.worker_count)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def download(
+        self,
+        pending_items: list[PendingDownload],
+        progress_callback: Callable[[int, int, int, int, int, int, int, int, int], None] | None = None,
+    ) -> list[DownloadOutcome]:
+        if self.closed:
+            raise RuntimeError("download worker pool is closed")
+        if not pending_items:
+            return []
+
+        pending_items = sorted_pending_downloads(pending_items)
+        expected_bytes = sum(item.metadata.rfc822_size or 0 for item in pending_items)
+        outcomes: list[DownloadOutcome] = []
+        successful_downloads = 0
+        newly_archived_downloads = 0
+        downloaded_bytes = 0
+        download_retries = 0
+        worker_reconnects = 0
+
+        for pending in pending_items:
+            self.task_queue.put(pending)
+
+        if progress_callback is not None:
+            progress_callback(
+                0,
+                len(pending_items),
+                0,
+                0,
+                0,
+                expected_bytes,
+                download_retries,
+                worker_reconnects,
+                self.worker_count,
+            )
+
+        while len(outcomes) < len(pending_items):
+            outcome = self.result_queue.get()
+            outcomes.append(outcome)
+            if outcome.byte_size is not None:
+                downloaded_bytes += outcome.byte_size
+                successful_downloads += 1
+                if not outcome.pending.restoring:
+                    newly_archived_downloads += 1
+            download_retries += outcome.retries
+            worker_reconnects += outcome.reconnects
+            completed = len(outcomes)
+            if progress_callback is not None:
+                progress_callback(
+                    completed,
+                    len(pending_items),
+                    successful_downloads,
+                    newly_archived_downloads,
+                    downloaded_bytes,
+                    expected_bytes,
+                    download_retries,
+                    worker_reconnects,
+                    self.worker_count,
+                )
+
+        self.task_queue.join()
+        return outcomes
+
+    def close(self) -> None:
+        if self.closed:
+            return
+
+        self.closed = True
+        for _ in self.threads:
+            self.task_queue.put(None)
+        self.task_queue.join()
+        for thread in self.threads:
+            thread.join()
+
+
+class DownloadPoolManager:
+    def __init__(self, credentials: Credentials, mailbox: Mailbox) -> None:
+        self.credentials = credentials
+        self.mailbox = mailbox
+        self.pool: DownloadWorkerPool | None = None
+
+    def download(
+        self,
+        worker_count: int,
+        pending_items: list[PendingDownload],
+        progress_callback: Callable[[int, int, int, int, int, int, int, int, int], None] | None = None,
+    ) -> list[DownloadOutcome]:
+        if self.pool is None or self.pool.worker_count != worker_count:
+            self.close()
+            self.pool = DownloadWorkerPool(self.credentials, self.mailbox, worker_count)
+        return self.pool.download(pending_items, progress_callback=progress_callback)
+
+    def close(self) -> None:
+        if self.pool is None:
+            return
+        self.pool.close()
+        self.pool = None
+
+
 def download_pending_messages(
     credentials: Credentials,
     mailbox: Mailbox,
@@ -1541,75 +1731,11 @@ def download_pending_messages(
         return []
 
     worker_count = max(1, min(worker_count, len(pending_items)))
-    pending_items = sorted_pending_downloads(pending_items)
-    expected_bytes = sum(item.metadata.rfc822_size or 0 for item in pending_items)
-    task_queue: Queue[PendingDownload | None] = Queue()
-    result_queue: Queue[DownloadOutcome] = Queue()
-    outcomes: list[DownloadOutcome] = []
-    successful_downloads = 0
-    newly_archived_downloads = 0
-    downloaded_bytes = 0
-    download_retries = 0
-    worker_reconnects = 0
-
-    threads = [
-        Thread(
-            target=download_worker,
-            args=(credentials, mailbox, task_queue, result_queue),
-            daemon=True,
-        )
-        for _ in range(worker_count)
-    ]
-    for thread in threads:
-        thread.start()
-
-    for pending in pending_items:
-        task_queue.put(pending)
-    for _ in threads:
-        task_queue.put(None)
-
-    if progress_callback is not None:
-        progress_callback(
-            0,
-            len(pending_items),
-            0,
-            0,
-            0,
-            expected_bytes,
-            download_retries,
-            worker_reconnects,
-            worker_count,
-        )
-
-    while len(outcomes) < len(pending_items):
-        outcome = result_queue.get()
-        outcomes.append(outcome)
-        if outcome.byte_size is not None:
-            downloaded_bytes += outcome.byte_size
-            successful_downloads += 1
-            if not outcome.pending.restoring:
-                newly_archived_downloads += 1
-        download_retries += outcome.retries
-        worker_reconnects += outcome.reconnects
-        completed = len(outcomes)
-        if progress_callback is not None:
-            progress_callback(
-                completed,
-                len(pending_items),
-                successful_downloads,
-                newly_archived_downloads,
-                downloaded_bytes,
-                expected_bytes,
-                download_retries,
-                worker_reconnects,
-                worker_count,
-            )
-
-    task_queue.join()
-    for thread in threads:
-        thread.join()
-
-    return outcomes
+    pool = DownloadWorkerPool(credentials, mailbox, worker_count)
+    try:
+        return pool.download(pending_items, progress_callback=progress_callback)
+    finally:
+        pool.close()
 
 
 def download_with_adaptive_workers(
@@ -1618,6 +1744,7 @@ def download_with_adaptive_workers(
     pending_items: list[PendingDownload],
     status: LiveStatus,
     stats: dict[str, int],
+    download_manager: DownloadPoolManager | None = None,
     progress_callback: Callable[[str, bool], None] | None = None,
 ) -> list[DownloadOutcome]:
     remaining = pending_items
@@ -1656,13 +1783,20 @@ def download_with_adaptive_workers(
                     completed == total,
                 )
 
-        outcomes = download_pending_messages(
-            credentials,
-            mailbox,
-            remaining,
-            worker_count,
-            progress_callback=on_download_progress,
-        )
+        if download_manager is None:
+            outcomes = download_pending_messages(
+                credentials,
+                mailbox,
+                remaining,
+                worker_count,
+                progress_callback=on_download_progress,
+            )
+        else:
+            outcomes = download_manager.download(
+                worker_count,
+                remaining,
+                progress_callback=on_download_progress,
+            )
         for outcome in outcomes:
             if outcome.byte_size is None:
                 continue
@@ -1694,6 +1828,8 @@ def download_with_adaptive_workers(
 
         stats["download_workers"] = next_worker_count
         stats["worker_backoffs"] += 1
+        if download_manager is not None:
+            download_manager.close()
         remaining = [outcome.pending for outcome in retryable]
         status.line(
             f"Gmail throttled or dropped connections; retrying {len(remaining)} messages "
@@ -1823,15 +1959,14 @@ def print_final_summary(summary: dict[str, Any], email_root: Path, elapsed_secon
     )
 
 
-def build_mailbox_plan(
+def build_mailbox_plan_from_state(
     connection: imaplib.IMAP4_SSL,
     mailbox: Mailbox,
-    state_store: StateStore,
+    state: dict[str, Any],
     *,
     force_full_scan: bool,
 ) -> MailboxPlan:
     message_count, uidvalidity = select_mailbox(connection, mailbox)
-    state = state_store.get_mailbox_state(mailbox.display_name)
     last_seen_uid = int_from_state(state.get("last_seen_uid"))
     backfill_before_uid = int_from_state(state.get("backfill_before_uid"))
     same_uidvalidity = uidvalidity is not None and state.get("uidvalidity") == uidvalidity
@@ -1858,6 +1993,99 @@ def build_mailbox_plan(
         end_uid=end_uid,
         uids=search_uids(connection, start_uid=start_uid, end_uid=end_uid),
     )
+
+
+def build_mailbox_plan_worker(
+    credentials: Credentials,
+    mailbox: Mailbox,
+    state: dict[str, Any],
+    force_full_scan: bool,
+) -> MailboxPlan:
+    connection = connect_and_login(credentials)
+    try:
+        return build_mailbox_plan_from_state(connection, mailbox, state, force_full_scan=force_full_scan)
+    finally:
+        close_connection(connection)
+
+
+def plan_mailboxes_concurrently(
+    credentials: Credentials,
+    mailboxes: list[Mailbox],
+    state_store: StateStore,
+    force_full_scan: bool,
+    indexed_message_count: int,
+    stats: dict[str, int],
+    status: LiveStatus,
+    operation_started_at: float,
+) -> list[MailboxPlan]:
+    mailbox_states = {mailbox.display_name: state_store.get_mailbox_state(mailbox.display_name) for mailbox in mailboxes}
+    worker_count = max(1, min(DEFAULT_DOWNLOAD_WORKERS, len(mailboxes)))
+    remaining = mailboxes
+    plans_by_name: dict[str, MailboxPlan] = {}
+
+    status.update(total_progress_message(stats, operation_started_at, "preparing account scan..."), force=True)
+
+    while remaining:
+        retry_mailboxes: list[Mailbox] = []
+        retry_errors: dict[str, str] = {}
+        active_workers = max(1, min(worker_count, len(remaining)))
+
+        with ThreadPoolExecutor(max_workers=active_workers, thread_name_prefix="gmail-plan") as executor:
+            future_to_mailbox = {
+                executor.submit(
+                    build_mailbox_plan_worker,
+                    credentials,
+                    mailbox,
+                    mailbox_states[mailbox.display_name],
+                    force_full_scan,
+                ): mailbox
+                for mailbox in remaining
+            }
+
+            for future in as_completed(future_to_mailbox):
+                mailbox = future_to_mailbox[future]
+                try:
+                    plan = future.result()
+                except Exception as exc:
+                    error = format_exception(exc)
+                    if is_retryable_download_error(error):
+                        retry_mailboxes.append(mailbox)
+                        retry_errors[mailbox.display_name] = error
+                    else:
+                        status.line()
+                        stats["errors"] += 1
+                        print(f"Mailbox planning error: {mailbox.display_name}: {error}")
+                    continue
+
+                plans_by_name[mailbox.display_name] = plan
+                stats["account_message_total"] = max(stats["account_message_total"], plan.message_count)
+                stats["work_total"] = stats["account_message_total"]
+                stats["work_done"] = min(indexed_message_count, stats["work_total"])
+                status.update(
+                    total_progress_message(stats, operation_started_at, "preparing account scan..."),
+                    force=False,
+                )
+
+        if not retry_mailboxes:
+            break
+
+        next_worker_count = reduced_worker_count(active_workers)
+        if next_worker_count == active_workers:
+            for mailbox in retry_mailboxes:
+                status.line()
+                stats["errors"] += 1
+                error = retry_errors.get(mailbox.display_name, "retryable Gmail connection limit reached")
+                print(f"Mailbox planning error: {mailbox.display_name}: {error}")
+            break
+
+        worker_count = next_worker_count
+        remaining = retry_mailboxes
+        status.line(
+            f"Gmail throttled mailbox planning; retrying {len(remaining)} mailboxes "
+            f"with {worker_count} workers."
+        )
+
+    return [plans_by_name[mailbox.display_name] for mailbox in mailboxes if mailbox.display_name in plans_by_name]
 
 
 def sync_mailbox(
@@ -1908,13 +2136,23 @@ def sync_mailbox(
 
     status.update(total_progress_message(stats, operation_started_at, "checking email details..."), force=True)
 
+    metadata_prefetcher = MetadataPrefetcher(credentials, mailbox)
+    download_manager = DownloadPoolManager(credentials, mailbox)
+    next_metadata_job: MetadataBatchJob | None = None
     offset = 0
     while offset < len(uids):
-        current_batch_size = clamp_metadata_batch_size(
-            int_from_stats(stats, "metadata_batch_size", DEFAULT_METADATA_BATCH_SIZE)
-        )
-        stats["metadata_batch_size"] = current_batch_size
-        uid_batch = uids[offset : offset + current_batch_size]
+        if next_metadata_job is not None and next_metadata_job.offset == offset:
+            metadata_job = next_metadata_job
+            next_metadata_job = None
+        else:
+            current_batch_size = clamp_metadata_batch_size(
+                int_from_stats(stats, "metadata_batch_size", DEFAULT_METADATA_BATCH_SIZE)
+            )
+            stats["metadata_batch_size"] = current_batch_size
+            metadata_job = schedule_metadata_batch(metadata_prefetcher, offset, uids, current_batch_size)
+
+        current_batch_size = metadata_job.batch_size
+        uid_batch = metadata_job.uids
         batch_failed = False
         metadata_fallback = False
         pending_downloads: list[PendingDownload] = []
@@ -1926,7 +2164,7 @@ def sync_mailbox(
         )
 
         try:
-            metadata_by_uid = fetch_metadata_batch(connection, uid_batch)
+            metadata_by_uid = metadata_job.future.result()
         except Exception as exc:
             next_batch_size = reduced_metadata_batch_size(current_batch_size)
             if next_batch_size < current_batch_size:
@@ -1953,6 +2191,13 @@ def sync_mailbox(
                     batch_failed = True
                     uid_text = uid.decode("ascii", "replace")
                     status.line(f"  Error on {mailbox.display_name} UID {uid_text}: {item_exc}")
+
+        next_offset = offset + len(uid_batch)
+        if not batch_failed and next_offset < len(uids):
+            next_batch_size = clamp_metadata_batch_size(
+                int_from_stats(stats, "metadata_batch_size", DEFAULT_METADATA_BATCH_SIZE)
+            )
+            next_metadata_job = schedule_metadata_batch(metadata_prefetcher, next_offset, uids, next_batch_size)
 
         messages_by_id = state_store.get_messages(
             [metadata.gmail_msg_id for metadata in metadata_by_uid.values()]
@@ -2125,6 +2370,7 @@ def sync_mailbox(
             pending_downloads,
             status,
             stats,
+            download_manager=download_manager,
             progress_callback=on_download_progress,
         )
         stats["active_downloaded"] = 0
@@ -2180,6 +2426,8 @@ def sync_mailbox(
                 f"  Stopped {mailbox.display_name} after a failed batch. "
                 "Next run will resume from the last completed UID."
             )
+            metadata_prefetcher.close()
+            download_manager.close()
             return
 
         checkpoint: dict[str, Any] = {"last_completed_at": iso_now()}
@@ -2212,6 +2460,8 @@ def sync_mailbox(
             state_store.commit()
             dirty_count = 0
 
+    metadata_prefetcher.close()
+    download_manager.close()
     if dirty_count:
         state_store.commit()
     if sync_mode == "incremental":
@@ -2248,8 +2498,7 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
     (email_root / "raw").mkdir(parents=True, exist_ok=True)
     status = LiveStatus()
 
-    removed_part_files = cleanup_part_files(email_root)
-    existing_files = build_existing_file_lookup(email_root / "raw")
+    removed_part_files, existing_files = run_startup_file_tasks(email_root)
 
     state_store = StateStore(email_root)
     try:
@@ -2286,28 +2535,16 @@ def download_archive(credentials: Credentials, connection: imaplib.IMAP4_SSL, em
         force_full_scan = state_store.has_missing_files()
         indexed_message_count = state_store.count_messages()
 
-        plans: list[MailboxPlan] = []
-        status.update(total_progress_message(stats, operation_started_at, "preparing account scan..."), force=True)
-        for mailbox in mailboxes:
-            try:
-                plan = build_mailbox_plan(
-                    connection,
-                    mailbox,
-                    state_store,
-                    force_full_scan=force_full_scan,
-                )
-                plans.append(plan)
-                stats["account_message_total"] = max(stats["account_message_total"], plan.message_count)
-                stats["work_total"] = stats["account_message_total"]
-                stats["work_done"] = min(indexed_message_count, stats["work_total"])
-                status.update(
-                    total_progress_message(stats, operation_started_at, "preparing account scan..."),
-                    force=False,
-                )
-            except Exception as exc:
-                status.line()
-                stats["errors"] += 1
-                print(f"Mailbox planning error: {exc}")
+        plans = plan_mailboxes_concurrently(
+            credentials,
+            mailboxes,
+            state_store,
+            force_full_scan,
+            indexed_message_count,
+            stats,
+            status,
+            operation_started_at,
+        )
 
         status.update(total_progress_message(stats, operation_started_at), force=True)
 

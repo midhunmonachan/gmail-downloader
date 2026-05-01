@@ -14,16 +14,17 @@ No Python packages need to be installed. The script uses only the Python standar
 
 ## Performance
 
-Downloads use parallel IMAP workers by default. The worker count is chosen from the machine CPU count and capped at 12 worker connections, leaving room for the main metadata connection and other mail clients.
+Downloads use parallel IMAP workers by default. The worker count is chosen from the machine CPU count and capped at 12 worker connections, leaving room for the main connection, one metadata prefetch connection, and other mail clients.
 
 The script also:
 
 - Fetches message metadata in adaptive batches up to 1000 UIDs, backing down when Gmail rejects a large batch and growing again after stable batches.
+- Plans selectable Gmail mailbox UID ranges concurrently and prefetches the next metadata batch while the current batch is being processed.
 - Pre-indexes existing `.eml` filenames once at startup instead of scanning the filesystem per message.
 - Avoids rehashing existing `.eml` files during normal scans; SHA-256 is still computed for newly downloaded messages while writing.
 - Stores message and mailbox state in SQLite for faster lookups as the archive grows.
 - Queues larger raw emails first inside each batch so parallel workers spend less time waiting on one large message at the end.
-- Downloads missing raw emails in parallel.
+- Downloads missing raw emails in parallel and keeps the worker pool alive across batches to avoid repeated IMAP login/thread startup cost.
 - Redownloads existing `.eml` files when their local byte size does not match Gmail's `RFC822.SIZE`.
 - Retries transient raw-email fetch failures inside each worker by reconnecting and reselecting the mailbox before retrying the same UID.
 - Automatically backs down worker count when Gmail reports known retryable connection/rate-limit errors.
